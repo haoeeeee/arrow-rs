@@ -43,10 +43,10 @@ use super::Buffer;
 #[derive(Debug)]
 pub struct MutableBuffer {
     // dangling iff capacity = 0
-    data: NonNull<u8>,
+    pub data: NonNull<u8>,
     // invariant: len <= capacity
-    len: usize,
-    capacity: usize,
+    pub len: usize,
+    pub capacity: usize,
 }
 
 impl MutableBuffer {
@@ -235,7 +235,7 @@ impl MutableBuffer {
     }
 
     #[inline]
-    pub(super) fn into_buffer(self) -> Buffer {
+    pub fn into_buffer(self) -> Buffer {
         let bytes = unsafe {
             Bytes::new(self.data, self.len, Deallocation::Native(self.capacity))
         };

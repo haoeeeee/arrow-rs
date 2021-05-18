@@ -27,6 +27,8 @@ use crate::error::{ArrowError, Result};
 
 use TimeUnit::*;
 
+use serde_derive::{Deserialize, Serialize};
+
 /// Sort the `ArrayRef` using `SortOptions`.
 ///
 /// Performs a stable sort on values and indices. Nulls are ordered according to the `nulls_first` flag in `options`.
@@ -361,7 +363,7 @@ pub fn sort_to_indices(
 }
 
 /// Options that define how sort kernels should behave
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct SortOptions {
     /// Whether to sort in descending order
     pub descending: bool,
