@@ -47,9 +47,10 @@ use crate::error::{ArrowError, Result};
 use crate::{array::*, compute::take};
 use crate::{buffer::Buffer, util::serialization::lexical_to_string};
 use num::{NumCast, ToPrimitive};
+use serde_derive::{Deserialize, Serialize};
 
 /// CastOptions provides a way to override the default cast behaviors
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CastOptions {
     /// how to handle cast failures, either return NULL (safe=true) or return ERR (safe=false)
     pub safe: bool,
