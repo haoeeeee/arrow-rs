@@ -18,7 +18,6 @@
 use std::any::Any;
 use std::fmt;
 use std::iter::IntoIterator;
-use std::mem;
 use std::{convert::From, iter::FromIterator};
 
 use super::{
@@ -70,24 +69,9 @@ pub struct DictionaryArray<K: ArrowPrimitiveType> {
 }
 
 impl<'a, K: ArrowPrimitiveType> DictionaryArray<K> {
-    /// Return an iterator to the keys of this dictionary.
+    /// Return an array view of the keys of this dictionary as a PrimitiveArray.
     pub fn keys(&self) -> &PrimitiveArray<K> {
         &self.keys
-    }
-
-    /// Returns an array view of the keys of this dictionary
-    pub fn keys_array(&self) -> PrimitiveArray<K> {
-        let data = self.data_ref();
-        let keys_data = ArrayData::new(
-            K::DATA_TYPE,
-            data.len(),
-            Some(data.null_count()),
-            data.null_buffer().cloned(),
-            data.offset(),
-            data.buffers().to_vec(),
-            vec![],
-        );
-        PrimitiveArray::<K>::from(keys_data)
     }
 
     /// Returns the lookup key by doing reverse dictionary lookup
@@ -101,9 +85,9 @@ impl<'a, K: ArrowPrimitiveType> DictionaryArray<K> {
             .flatten()
     }
 
-    /// Returns an `ArrayRef` to the dictionary values.
-    pub fn values(&self) -> ArrayRef {
-        self.values.clone()
+    /// Returns a reference to the dictionary values array
+    pub fn values(&self) -> &ArrayRef {
+        &self.values
     }
 
     /// Returns a clone of the value type of this list.
@@ -169,6 +153,22 @@ impl<T: ArrowPrimitiveType> From<ArrayData> for DictionaryArray<T> {
 }
 
 /// Constructs a `DictionaryArray` from an iterator of optional strings.
+///
+/// # Example:
+/// ```
+/// use arrow::array::{DictionaryArray, PrimitiveArray, StringArray};
+/// use arrow::datatypes::Int8Type;
+///
+/// let test = vec!["a", "a", "b", "c"];
+/// let array: DictionaryArray<Int8Type> = test
+///     .iter()
+///     .map(|&x| if x == "b" { None } else { Some(x) })
+///     .collect();
+/// assert_eq!(
+///     "DictionaryArray {keys: PrimitiveArray<Int8>\n[\n  0,\n  0,\n  null,\n  1,\n] values: StringArray\n[\n  \"a\",\n  \"c\",\n]}\n",
+///     format!("{:?}", array)
+/// );
+/// ```
 impl<'a, T: ArrowPrimitiveType + ArrowDictionaryKeyType> FromIterator<Option<&'a str>>
     for DictionaryArray<T>
 {
@@ -197,6 +197,20 @@ impl<'a, T: ArrowPrimitiveType + ArrowDictionaryKeyType> FromIterator<Option<&'a
 }
 
 /// Constructs a `DictionaryArray` from an iterator of strings.
+///
+/// # Example:
+///
+/// ```
+/// use arrow::array::{DictionaryArray, PrimitiveArray, StringArray};
+/// use arrow::datatypes::Int8Type;
+///
+/// let test = vec!["a", "a", "b", "c"];
+/// let array: DictionaryArray<Int8Type> = test.into_iter().collect();
+/// assert_eq!(
+///     "DictionaryArray {keys: PrimitiveArray<Int8>\n[\n  0,\n  0,\n  1,\n  2,\n] values: StringArray\n[\n  \"a\",\n  \"b\",\n  \"c\",\n]}\n",
+///     format!("{:?}", array)
+/// );
+/// ```
 impl<'a, T: ArrowPrimitiveType + ArrowDictionaryKeyType> FromIterator<&'a str>
     for DictionaryArray<T>
 {
@@ -217,24 +231,12 @@ impl<'a, T: ArrowPrimitiveType + ArrowDictionaryKeyType> FromIterator<&'a str>
 }
 
 impl<T: ArrowPrimitiveType> Array for DictionaryArray<T> {
-    fn as_any(&self) -> &Any {
+    fn as_any(&self) -> &dyn Any {
         self
     }
 
     fn data(&self) -> &ArrayData {
         &self.data
-    }
-
-    fn get_buffer_memory_size(&self) -> usize {
-        // Since both `keys` and `values` derive (are references from) `data`, we only need to account for `data`.
-        self.data.get_buffer_memory_size()
-    }
-
-    fn get_array_memory_size(&self) -> usize {
-        self.data.get_array_memory_size()
-            + self.keys.get_array_memory_size()
-            + self.values.get_array_memory_size()
-            + mem::size_of_val(self)
     }
 }
 
@@ -379,7 +381,7 @@ mod tests {
         let test = vec!["a", "b", "c", "a"];
         let array: DictionaryArray<Int8Type> = test.into_iter().collect();
 
-        let keys = array.keys_array();
+        let keys = array.keys();
         assert_eq!(&DataType::Int8, keys.data_type());
         assert_eq!(0, keys.null_count());
         assert_eq!(&[0, 1, 2, 0], keys.values());
@@ -390,16 +392,16 @@ mod tests {
         let test = vec![Some("a"), None, Some("b"), None, None, Some("a")];
         let array: DictionaryArray<Int32Type> = test.into_iter().collect();
 
-        let keys = array.keys_array();
+        let keys = array.keys();
         assert_eq!(&DataType::Int32, keys.data_type());
         assert_eq!(3, keys.null_count());
 
-        assert_eq!(true, keys.is_valid(0));
-        assert_eq!(false, keys.is_valid(1));
-        assert_eq!(true, keys.is_valid(2));
-        assert_eq!(false, keys.is_valid(3));
-        assert_eq!(false, keys.is_valid(4));
-        assert_eq!(true, keys.is_valid(5));
+        assert!(keys.is_valid(0));
+        assert!(!keys.is_valid(1));
+        assert!(keys.is_valid(2));
+        assert!(!keys.is_valid(3));
+        assert!(!keys.is_valid(4));
+        assert!(keys.is_valid(5));
 
         assert_eq!(0, keys.value(0));
         assert_eq!(1, keys.value(2));

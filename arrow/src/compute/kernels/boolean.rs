@@ -33,7 +33,7 @@ use crate::datatypes::{ArrowNumericType, DataType};
 use crate::error::{ArrowError, Result};
 use crate::util::bit_util::{ceil, round_upto_multiple_of_64};
 use core::iter;
-use lexical_core::Integer;
+use num::Zero;
 
 fn binary_boolean_kleene_kernel<F>(
     left: &BooleanArray,
@@ -191,14 +191,14 @@ where
 
     let left_data = left.data_ref();
     let right_data = right.data_ref();
-    let null_bit_buffer = combine_option_bitmap(&left_data, &right_data, len)?;
+    let null_bit_buffer = combine_option_bitmap(left_data, right_data, len)?;
 
     let left_buffer = &left_data.buffers()[0];
     let right_buffer = &right_data.buffers()[0];
     let left_offset = left.offset();
     let right_offset = right.offset();
 
-    let values = op(&left_buffer, left_offset, &right_buffer, right_offset, len);
+    let values = op(left_buffer, left_offset, right_buffer, right_offset, len);
 
     let data = ArrayData::new(
         DataType::Boolean,
@@ -230,7 +230,7 @@ where
 /// # }
 /// ```
 pub fn and(left: &BooleanArray, right: &BooleanArray) -> Result<BooleanArray> {
-    binary_boolean_kernel(&left, &right, buffer_bin_and)
+    binary_boolean_kernel(left, right, buffer_bin_and)
 }
 
 /// Logical 'and' boolean values with Kleene logic
@@ -300,7 +300,7 @@ pub fn and_kleene(left: &BooleanArray, right: &BooleanArray) -> Result<BooleanAr
 /// # }
 /// ```
 pub fn or(left: &BooleanArray, right: &BooleanArray) -> Result<BooleanArray> {
-    binary_boolean_kernel(&left, &right, buffer_bin_or)
+    binary_boolean_kernel(left, right, buffer_bin_or)
 }
 
 /// Logical 'or' boolean values with Kleene logic
@@ -376,7 +376,7 @@ pub fn not(left: &BooleanArray) -> Result<BooleanArray> {
     let null_bit_buffer = data
         .null_bitmap()
         .as_ref()
-        .map(|b| b.bits.slice(left_offset));
+        .map(|b| b.bits.bit_slice(left_offset, len));
 
     let values = buffer_unary_not(&data.buffers()[0], left_offset, len);
 
@@ -407,7 +407,7 @@ pub fn not(left: &BooleanArray) -> Result<BooleanArray> {
 /// # Ok(())
 /// # }
 /// ```
-pub fn is_null(input: &Array) -> Result<BooleanArray> {
+pub fn is_null(input: &dyn Array) -> Result<BooleanArray> {
     let len = input.len();
 
     let output = match input.data_ref().null_buffer() {
@@ -439,7 +439,7 @@ pub fn is_null(input: &Array) -> Result<BooleanArray> {
 /// # Ok(())
 /// # }
 /// ```
-pub fn is_not_null(input: &Array) -> Result<BooleanArray> {
+pub fn is_not_null(input: &dyn Array) -> Result<BooleanArray> {
     let len = input.len();
 
     let output = match input.data_ref().null_buffer() {
@@ -814,6 +814,19 @@ mod tests {
     }
 
     #[test]
+    fn test_bool_array_not_sliced() {
+        let a = BooleanArray::from(vec![None, Some(true), Some(false), None, Some(true)]);
+        let a = a.slice(1, 4);
+        let a = a.as_any().downcast_ref::<BooleanArray>().unwrap();
+        let c = not(a).unwrap();
+
+        let expected =
+            BooleanArray::from(vec![Some(false), Some(true), None, Some(false)]);
+
+        assert_eq!(c, expected);
+    }
+
+    #[test]
     fn test_bool_array_and_nulls() {
         let a = BooleanArray::from(vec![
             None,
@@ -870,7 +883,7 @@ mod tests {
         let b = b.slice(8, 4);
         let b = b.as_any().downcast_ref::<BooleanArray>().unwrap();
 
-        let c = and(&a, &b).unwrap();
+        let c = and(a, b).unwrap();
 
         let expected = BooleanArray::from(vec![false, false, false, true]);
 
@@ -893,7 +906,7 @@ mod tests {
         let b = b.slice(8, 4);
         let b = b.as_any().downcast_ref::<BooleanArray>().unwrap();
 
-        let c = and(&a, &b).unwrap();
+        let c = and(a, b).unwrap();
 
         let expected = BooleanArray::from(vec![false, false, false, true]);
 
@@ -911,7 +924,7 @@ mod tests {
         let a = a.slice(8, 4);
         let a = a.as_any().downcast_ref::<BooleanArray>().unwrap();
 
-        let c = and(&a, &b).unwrap();
+        let c = and(a, &b).unwrap();
 
         let expected = BooleanArray::from(vec![false, false, false, true]);
 
@@ -929,7 +942,7 @@ mod tests {
         let b = b.slice(8, 4);
         let b = b.as_any().downcast_ref::<BooleanArray>().unwrap();
 
-        let c = and(&a, &b).unwrap();
+        let c = and(&a, b).unwrap();
 
         let expected = BooleanArray::from(vec![false, false, false, true]);
 
@@ -954,7 +967,7 @@ mod tests {
         let b = b.slice(2, 4);
         let b = b.as_any().downcast_ref::<BooleanArray>().unwrap();
 
-        let c = and(&a, &b).unwrap();
+        let c = and(a, b).unwrap();
 
         let expected =
             BooleanArray::from(vec![Some(false), Some(false), None, Some(true)]);
@@ -1134,7 +1147,7 @@ mod tests {
         ]);
         let comp = comp.slice(2, 3); // Some(false), None, Some(true)
         let comp = comp.as_any().downcast_ref::<BooleanArray>().unwrap();
-        let res = nullif(&a, &comp).unwrap();
+        let res = nullif(a, comp).unwrap();
 
         let expected = Int32Array::from(vec![
             Some(15), // False => keep it

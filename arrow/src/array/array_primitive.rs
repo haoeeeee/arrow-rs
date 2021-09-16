@@ -44,6 +44,19 @@ const MICROSECONDS: i64 = 1_000_000;
 const NANOSECONDS: i64 = 1_000_000_000;
 
 /// Array whose elements are of primitive types.
+///
+/// # Example: From an iterator of values
+///
+/// ```
+/// use arrow::array::{Array, PrimitiveArray};
+/// use arrow::datatypes::Int32Type;
+/// let arr: PrimitiveArray<Int32Type> = PrimitiveArray::from_iter_values((0..10).map(|x| x + 1));
+/// assert_eq!(10, arr.len());
+/// assert_eq!(0, arr.null_count());
+/// for i in 0..10i32 {
+///     assert_eq!(i + 1, arr.value(i as usize));
+/// }
+/// ```
 pub struct PrimitiveArray<T: ArrowPrimitiveType> {
     /// Underlying ArrayData
     /// # Safety
@@ -93,6 +106,7 @@ impl<T: ArrowPrimitiveType> PrimitiveArray<T> {
     /// # Safety
     ///
     /// caller must ensure that the passed in offset is less than the array len()
+    #[inline]
     pub unsafe fn value_unchecked(&self, i: usize) -> T::Native {
         let offset = i + self.offset();
         *self.raw_values.as_ptr().add(offset)
@@ -100,11 +114,10 @@ impl<T: ArrowPrimitiveType> PrimitiveArray<T> {
 
     /// Returns the primitive value at index `i`.
     ///
-    /// Note this doesn't do any bound checking, for performance reason.
-    /// # Safety
-    /// caller must ensure that the passed in offset is less than the array len()
+    /// Panics of offset `i` is out of bounds
+    #[inline]
     pub fn value(&self, i: usize) -> T::Native {
-        debug_assert!(i < self.len());
+        assert!(i < self.len());
         unsafe { self.value_unchecked(i) }
     }
 
@@ -141,22 +154,12 @@ impl<T: ArrowPrimitiveType> PrimitiveArray<T> {
 }
 
 impl<T: ArrowPrimitiveType> Array for PrimitiveArray<T> {
-    fn as_any(&self) -> &Any {
+    fn as_any(&self) -> &dyn Any {
         self
     }
 
     fn data(&self) -> &ArrayData {
         &self.data
-    }
-
-    /// Returns the total number of bytes of memory occupied by the buffers owned by this [PrimitiveArray].
-    fn get_buffer_memory_size(&self) -> usize {
-        self.data.get_buffer_memory_size()
-    }
-
-    /// Returns the total number of bytes of memory occupied physically by this [PrimitiveArray].
-    fn get_array_memory_size(&self) -> usize {
-        self.data.get_array_memory_size() + mem::size_of::<RawPtrBox<T::Native>>()
     }
 }
 
@@ -307,7 +310,7 @@ impl<'a, T: ArrowPrimitiveType> IntoIterator for &'a PrimitiveArray<T> {
 impl<'a, T: ArrowPrimitiveType> PrimitiveArray<T> {
     /// constructs a new iterator
     pub fn iter(&'a self) -> PrimitiveIter<'a, T> {
-        PrimitiveIter::<'a, T>::new(&self)
+        PrimitiveIter::<'a, T>::new(self)
     }
 }
 
@@ -506,9 +509,6 @@ mod tests {
             assert!(arr.is_valid(i));
             assert_eq!(i as i32, arr.value(i));
         }
-
-        assert_eq!(64, arr.get_buffer_memory_size());
-        assert_eq!(136, arr.get_array_memory_size());
     }
 
     #[test]
@@ -528,9 +528,6 @@ mod tests {
                 assert!(!arr.is_valid(i));
             }
         }
-
-        assert_eq!(128, arr.get_buffer_memory_size());
-        assert_eq!(216, arr.get_array_memory_size());
     }
 
     #[test]
@@ -775,19 +772,19 @@ mod tests {
 
         let bool_arr = arr2.as_any().downcast_ref::<BooleanArray>().unwrap();
 
-        assert_eq!(false, bool_arr.is_valid(0));
+        assert!(!bool_arr.is_valid(0));
 
-        assert_eq!(true, bool_arr.is_valid(1));
-        assert_eq!(true, bool_arr.value(1));
+        assert!(bool_arr.is_valid(1));
+        assert!(bool_arr.value(1));
 
-        assert_eq!(true, bool_arr.is_valid(2));
-        assert_eq!(false, bool_arr.value(2));
+        assert!(bool_arr.is_valid(2));
+        assert!(!bool_arr.value(2));
 
-        assert_eq!(true, bool_arr.is_valid(3));
-        assert_eq!(true, bool_arr.value(3));
+        assert!(bool_arr.is_valid(3));
+        assert!(bool_arr.value(3));
 
-        assert_eq!(true, bool_arr.is_valid(4));
-        assert_eq!(false, bool_arr.value(4));
+        assert!(bool_arr.is_valid(4));
+        assert!(!bool_arr.value(4));
     }
 
     #[test]

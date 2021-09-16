@@ -27,9 +27,8 @@ use std::ops::{Add, Div, Mul, Neg, Rem, Sub};
 use num::{One, Zero};
 
 use crate::buffer::Buffer;
-#[cfg(simd)]
+#[cfg(feature = "simd")]
 use crate::buffer::MutableBuffer;
-#[cfg(not(simd))]
 use crate::compute::kernels::arity::unary;
 use crate::compute::util::combine_option_bitmap;
 use crate::datatypes;
@@ -37,13 +36,13 @@ use crate::datatypes::ArrowNumericType;
 use crate::error::{ArrowError, Result};
 use crate::{array::*, util::bit_util};
 use num::traits::Pow;
-#[cfg(simd)]
+#[cfg(feature = "simd")]
 use std::borrow::BorrowMut;
-#[cfg(simd)]
+#[cfg(feature = "simd")]
 use std::slice::{ChunksExact, ChunksExactMut};
 
 /// SIMD vectorized version of `unary_math_op` above specialized for signed numerical values.
-#[cfg(simd)]
+#[cfg(feature = "simd")]
 fn simd_signed_unary_math_op<T, SIMD_OP, SCALAR_OP>(
     array: &PrimitiveArray<T>,
     simd_op: SIMD_OP,
@@ -83,7 +82,10 @@ where
         T::DATA_TYPE,
         array.len(),
         None,
-        array.data_ref().null_buffer().cloned(),
+        array
+            .data_ref()
+            .null_buffer()
+            .map(|b| b.bit_slice(array.offset(), array.len())),
         0,
         vec![result.into()],
         vec![],
@@ -91,7 +93,7 @@ where
     Ok(PrimitiveArray::<T>::from(data))
 }
 
-#[cfg(simd)]
+#[cfg(feature = "simd")]
 fn simd_float_unary_math_op<T, SIMD_OP, SCALAR_OP>(
     array: &PrimitiveArray<T>,
     simd_op: SIMD_OP,
@@ -132,7 +134,10 @@ where
         T::DATA_TYPE,
         array.len(),
         None,
-        array.data_ref().null_buffer().cloned(),
+        array
+            .data_ref()
+            .null_buffer()
+            .map(|b| b.bit_slice(array.offset(), array.len())),
         0,
         vec![result.into()],
         vec![],
@@ -219,7 +224,7 @@ where
                 let is_valid = unsafe { bit_util::get_bit_raw(b.as_ptr(), i) };
                 if is_valid {
                     if right.is_zero() {
-                        Err(ArrowError::ModulusByZero)
+                        Err(ArrowError::DivideByZero)
                     } else {
                         Ok(*left % *right)
                     }
@@ -237,7 +242,7 @@ where
             .zip(right.values())
             .map(|(left, right)| {
                 if right.is_zero() {
-                    Err(ArrowError::ModulusByZero)
+                    Err(ArrowError::DivideByZero)
                 } else {
                     Ok(*left % *right)
                 }
@@ -335,22 +340,10 @@ where
     T::Native: Rem<Output = T::Native> + Zero,
 {
     if modulo.is_zero() {
-        return Err(ArrowError::ModulusByZero);
+        return Err(ArrowError::DivideByZero);
     }
 
-    let values = array.values().iter().map(|value| *value % modulo);
-    let buffer = unsafe { Buffer::from_trusted_len_iter(values) };
-
-    let data = ArrayData::new(
-        T::DATA_TYPE,
-        array.len(),
-        None,
-        array.data_ref().null_buffer().cloned(),
-        0,
-        vec![buffer],
-        vec![],
-    );
-    Ok(PrimitiveArray::<T>::from(data))
+    Ok(unary(array, |value| value % modulo))
 }
 
 /// Scalar-divisor version of `math_divide`.
@@ -366,23 +359,11 @@ where
         return Err(ArrowError::DivideByZero);
     }
 
-    let values = array.values().iter().map(|value| *value / divisor);
-    let buffer = unsafe { Buffer::from_trusted_len_iter(values) };
-
-    let data = ArrayData::new(
-        T::DATA_TYPE,
-        array.len(),
-        None,
-        array.data_ref().null_buffer().cloned(),
-        0,
-        vec![buffer],
-        vec![],
-    );
-    Ok(PrimitiveArray::<T>::from(data))
+    Ok(unary(array, |value| value / divisor))
 }
 
 /// SIMD vectorized version of `math_op` above.
-#[cfg(simd)]
+#[cfg(feature = "simd")]
 fn simd_math_op<T, SIMD_OP, SCALAR_OP>(
     left: &PrimitiveArray<T>,
     right: &PrimitiveArray<T>,
@@ -445,9 +426,9 @@ where
 }
 
 /// SIMD vectorized implementation of `left % right`.
-/// If any of the lanes marked as valid in `valid_mask` are `0` then an `ArrowError::ModulusByZero`
+/// If any of the lanes marked as valid in `valid_mask` are `0` then an `ArrowError::DivideByZero`
 /// is returned. The contents of no-valid lanes are undefined.
-#[cfg(simd)]
+#[cfg(feature = "simd")]
 #[inline]
 fn simd_checked_modulus<T: ArrowNumericType>(
     valid_mask: Option<u64>,
@@ -472,7 +453,7 @@ where
     let zero_mask = T::eq(right_no_invalid_zeros, zero);
 
     if T::mask_any(zero_mask) {
-        Err(ArrowError::ModulusByZero)
+        Err(ArrowError::DivideByZero)
     } else {
         Ok(T::bin_op(left, right_no_invalid_zeros, |a, b| a % b))
     }
@@ -481,7 +462,7 @@ where
 /// SIMD vectorized implementation of `left / right`.
 /// If any of the lanes marked as valid in `valid_mask` are `0` then an `ArrowError::DivideByZero`
 /// is returned. The contents of no-valid lanes are undefined.
-#[cfg(simd)]
+#[cfg(feature = "simd")]
 #[inline]
 fn simd_checked_divide<T: ArrowNumericType>(
     valid_mask: Option<u64>,
@@ -513,8 +494,8 @@ where
 }
 
 /// Scalar implementation of `left % right` for the remainder elements after complete chunks have been processed using SIMD.
-/// If any of the values marked as valid in `valid_mask` are `0` then an `ArrowError::ModulusByZero` is returned.
-#[cfg(simd)]
+/// If any of the values marked as valid in `valid_mask` are `0` then an `ArrowError::DivideByZero` is returned.
+#[cfg(feature = "simd")]
 #[inline]
 fn simd_checked_modulus_remainder<T: ArrowNumericType>(
     valid_mask: Option<u64>,
@@ -536,7 +517,7 @@ where
         .try_for_each(|(i, (result_scalar, (left_scalar, right_scalar)))| {
             if valid_mask.map(|mask| mask & (1 << i) != 0).unwrap_or(true) {
                 if *right_scalar == T::Native::zero() {
-                    return Err(ArrowError::ModulusByZero);
+                    return Err(ArrowError::DivideByZero);
                 }
                 *result_scalar = *left_scalar % *right_scalar;
             }
@@ -548,7 +529,7 @@ where
 
 /// Scalar implementation of `left / right` for the remainder elements after complete chunks have been processed using SIMD.
 /// If any of the values marked as valid in `valid_mask` are `0` then an `ArrowError::DivideByZero` is returned.
-#[cfg(simd)]
+#[cfg(feature = "simd")]
 #[inline]
 fn simd_checked_divide_remainder<T: ArrowNumericType>(
     valid_mask: Option<u64>,
@@ -581,7 +562,7 @@ where
 }
 
 /// Scalar-modulo version of `simd_checked_modulus_remainder`.
-#[cfg(simd)]
+#[cfg(feature = "simd")]
 #[inline]
 fn simd_checked_modulus_scalar_remainder<T: ArrowNumericType>(
     array_chunks: ChunksExact<T::Native>,
@@ -592,7 +573,7 @@ where
     T::Native: Zero + Rem<Output = T::Native>,
 {
     if modulo.is_zero() {
-        return Err(ArrowError::ModulusByZero);
+        return Err(ArrowError::DivideByZero);
     }
 
     let result_remainder = result_chunks.into_remainder();
@@ -609,7 +590,7 @@ where
 }
 
 /// Scalar-divisor version of `simd_checked_divide_remainder`.
-#[cfg(simd)]
+#[cfg(feature = "simd")]
 #[inline]
 fn simd_checked_divide_scalar_remainder<T: ArrowNumericType>(
     array_chunks: ChunksExact<T::Native>,
@@ -640,7 +621,7 @@ where
 ///
 /// The modulus kernels need their own implementation as there is a need to handle situations
 /// where a modulus by `0` occurs.  This is complicated by `NULL` slots and padding.
-#[cfg(simd)]
+#[cfg(feature = "simd")]
 fn simd_modulus<T>(
     left: &PrimitiveArray<T>,
     right: &PrimitiveArray<T>,
@@ -760,7 +741,7 @@ where
 ///
 /// The divide kernels need their own implementation as there is a need to handle situations
 /// where a divide by `0` occurs.  This is complicated by `NULL` slots and padding.
-#[cfg(simd)]
+#[cfg(feature = "simd")]
 fn simd_divide<T>(
     left: &PrimitiveArray<T>,
     right: &PrimitiveArray<T>,
@@ -877,7 +858,7 @@ where
 }
 
 /// SIMD vectorized version of `modulus_scalar`.
-#[cfg(simd)]
+#[cfg(feature = "simd")]
 fn simd_modulus_scalar<T>(
     array: &PrimitiveArray<T>,
     modulo: T::Native,
@@ -887,7 +868,7 @@ where
     T::Native: One + Zero + Rem<Output = T::Native>,
 {
     if modulo.is_zero() {
-        return Err(ArrowError::ModulusByZero);
+        return Err(ArrowError::DivideByZero);
     }
 
     let lanes = T::lanes();
@@ -914,7 +895,10 @@ where
         T::DATA_TYPE,
         array.len(),
         None,
-        array.data_ref().null_buffer().cloned(),
+        array
+            .data_ref()
+            .null_buffer()
+            .map(|b| b.bit_slice(array.offset(), array.len())),
         0,
         vec![result.into()],
         vec![],
@@ -923,7 +907,7 @@ where
 }
 
 /// SIMD vectorized version of `divide_scalar`.
-#[cfg(simd)]
+#[cfg(feature = "simd")]
 fn simd_divide_scalar<T>(
     array: &PrimitiveArray<T>,
     divisor: T::Native,
@@ -960,7 +944,10 @@ where
         T::DATA_TYPE,
         array.len(),
         None,
-        array.data_ref().null_buffer().cloned(),
+        array
+            .data_ref()
+            .null_buffer()
+            .map(|b| b.bit_slice(array.offset(), array.len())),
         0,
         vec![result.into()],
         vec![],
@@ -982,9 +969,9 @@ where
         + Div<Output = T::Native>
         + Zero,
 {
-    #[cfg(simd)]
+    #[cfg(feature = "simd")]
     return simd_math_op(&left, &right, |a, b| a + b, |a, b| a + b);
-    #[cfg(not(simd))]
+    #[cfg(not(feature = "simd"))]
     return math_op(left, right, |a, b| a + b);
 }
 
@@ -1002,9 +989,9 @@ where
         + Div<Output = T::Native>
         + Zero,
 {
-    #[cfg(simd)]
+    #[cfg(feature = "simd")]
     return simd_math_op(&left, &right, |a, b| a - b, |a, b| a - b);
-    #[cfg(not(simd))]
+    #[cfg(not(feature = "simd"))]
     return math_op(left, right, |a, b| a - b);
 }
 
@@ -1014,9 +1001,9 @@ where
     T: datatypes::ArrowSignedNumericType,
     T::Native: Neg<Output = T::Native>,
 {
-    #[cfg(simd)]
+    #[cfg(feature = "simd")]
     return simd_signed_unary_math_op(array, |x| -x, |x| -x);
-    #[cfg(not(simd))]
+    #[cfg(not(feature = "simd"))]
     return Ok(unary(array, |x| -x));
 }
 
@@ -1029,7 +1016,7 @@ where
     T: datatypes::ArrowFloatNumericType,
     T::Native: Pow<T::Native, Output = T::Native>,
 {
-    #[cfg(simd)]
+    #[cfg(feature = "simd")]
     {
         let raise_vector = T::init(raise);
         return simd_float_unary_math_op(
@@ -1038,7 +1025,7 @@ where
             |x| x.pow(raise),
         );
     }
-    #[cfg(not(simd))]
+    #[cfg(not(feature = "simd"))]
     return Ok(unary(array, |x| x.pow(raise)));
 }
 
@@ -1057,15 +1044,15 @@ where
         + Rem<Output = T::Native>
         + Zero,
 {
-    #[cfg(simd)]
+    #[cfg(feature = "simd")]
     return simd_math_op(&left, &right, |a, b| a * b, |a, b| a * b);
-    #[cfg(not(simd))]
+    #[cfg(not(feature = "simd"))]
     return math_op(left, right, |a, b| a * b);
 }
 
 /// Perform `left % right` operation on two arrays. If either left or right value is null
 /// then the result is also null. If any right hand value is zero then the result of this
-/// operation will be `Err(ArrowError::ModulusByZero)`.
+/// operation will be `Err(ArrowError::DivideByZero)`.
 pub fn modulus<T>(
     left: &PrimitiveArray<T>,
     right: &PrimitiveArray<T>,
@@ -1080,10 +1067,10 @@ where
         + Zero
         + One,
 {
-    #[cfg(simd)]
+    #[cfg(feature = "simd")]
     return simd_modulus(&left, &right);
-    #[cfg(not(simd))]
-    return math_modulus(&left, &right);
+    #[cfg(not(feature = "simd"))]
+    return math_modulus(left, right);
 }
 
 /// Perform `left / right` operation on two arrays. If either left or right value is null
@@ -1103,15 +1090,15 @@ where
         + Zero
         + One,
 {
-    #[cfg(simd)]
+    #[cfg(feature = "simd")]
     return simd_divide(&left, &right);
-    #[cfg(not(simd))]
-    return math_divide(&left, &right);
+    #[cfg(not(feature = "simd"))]
+    return math_divide(left, right);
 }
 
 /// Modulus every value in an array by a scalar. If any value in the array is null then the
 /// result is also null. If the scalar is zero then the result of this operation will be
-/// `Err(ArrowError::ModulusByZero)`.
+/// `Err(ArrowError::DivideByZero)`.
 pub fn modulus_scalar<T>(
     array: &PrimitiveArray<T>,
     modulo: T::Native,
@@ -1126,10 +1113,10 @@ where
         + Zero
         + One,
 {
-    #[cfg(simd)]
+    #[cfg(feature = "simd")]
     return simd_modulus_scalar(&array, modulo);
-    #[cfg(not(simd))]
-    return math_modulus_scalar(&array, modulo);
+    #[cfg(not(feature = "simd"))]
+    return math_modulus_scalar(array, modulo);
 }
 
 /// Divide every value in an array by a scalar. If any value in the array is null then the
@@ -1149,10 +1136,10 @@ where
         + Zero
         + One,
 {
-    #[cfg(simd)]
+    #[cfg(feature = "simd")]
     return simd_divide_scalar(&array, divisor);
-    #[cfg(not(simd))]
-    return math_divide_scalar(&array, divisor);
+    #[cfg(not(feature = "simd"))]
+    return math_divide_scalar(array, divisor);
 }
 
 #[cfg(test)]
@@ -1184,7 +1171,7 @@ mod tests {
         assert_eq!(5, a.value(0));
         assert_eq!(6, b.value(0));
 
-        let c = add(&a, &b).unwrap();
+        let c = add(a, b).unwrap();
         assert_eq!(5, c.len());
         assert_eq!(11, c.value(0));
         assert_eq!(13, c.value(1));
@@ -1264,12 +1251,32 @@ mod tests {
     }
 
     #[test]
+    fn test_primitive_array_divide_scalar_sliced() {
+        let a = Int32Array::from(vec![Some(15), None, Some(9), Some(8), None]);
+        let a = a.slice(1, 4);
+        let a = as_primitive_array(&a);
+        let actual = divide_scalar(a, 3).unwrap();
+        let expected = Int32Array::from(vec![None, Some(3), Some(2), None]);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn test_primitive_array_modulus_scalar() {
         let a = Int32Array::from(vec![15, 14, 9, 8, 1]);
         let b = 3;
         let c = modulus_scalar(&a, b).unwrap();
         let expected = Int32Array::from(vec![0, 2, 0, 2, 1]);
         assert_eq!(c, expected);
+    }
+
+    #[test]
+    fn test_primitive_array_modulus_scalar_sliced() {
+        let a = Int32Array::from(vec![Some(15), None, Some(9), Some(8), None]);
+        let a = a.slice(1, 4);
+        let a = as_primitive_array(&a);
+        let actual = modulus_scalar(a, 3).unwrap();
+        let expected = Int32Array::from(vec![None, Some(0), Some(2), None]);
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -1281,7 +1288,7 @@ mod tests {
         let a = a.as_any().downcast_ref::<Int32Array>().unwrap();
         let b = b.as_any().downcast_ref::<Int32Array>().unwrap();
 
-        let c = divide(&a, &b).unwrap();
+        let c = divide(a, b).unwrap();
         assert_eq!(5, c.len());
         assert_eq!(3, c.value(0));
         assert_eq!(2, c.value(1));
@@ -1299,7 +1306,7 @@ mod tests {
         let a = a.as_any().downcast_ref::<Int32Array>().unwrap();
         let b = b.as_any().downcast_ref::<Int32Array>().unwrap();
 
-        let c = modulus(&a, &b).unwrap();
+        let c = modulus(a, b).unwrap();
         assert_eq!(5, c.len());
         assert_eq!(0, c.value(0));
         assert_eq!(3, c.value(1));
@@ -1314,11 +1321,24 @@ mod tests {
         let b = Int32Array::from(vec![Some(5), Some(6), Some(8), Some(9), None, None]);
         let c = divide(&a, &b).unwrap();
         assert_eq!(3, c.value(0));
-        assert_eq!(true, c.is_null(1));
+        assert!(c.is_null(1));
         assert_eq!(1, c.value(2));
         assert_eq!(0, c.value(3));
-        assert_eq!(true, c.is_null(4));
-        assert_eq!(true, c.is_null(5));
+        assert!(c.is_null(4));
+        assert!(c.is_null(5));
+    }
+
+    #[test]
+    fn test_primitive_array_modulus_with_nulls() {
+        let a = Int32Array::from(vec![Some(15), None, Some(8), Some(1), Some(9), None]);
+        let b = Int32Array::from(vec![Some(5), Some(6), Some(8), Some(9), None, None]);
+        let c = modulus(&a, &b).unwrap();
+        assert_eq!(0, c.value(0));
+        assert!(c.is_null(1));
+        assert_eq!(0, c.value(2));
+        assert_eq!(1, c.value(3));
+        assert!(c.is_null(4));
+        assert!(c.is_null(5));
     }
 
     #[test]
@@ -1397,14 +1417,67 @@ mod tests {
         let b = b.slice(8, 6);
         let b = b.as_any().downcast_ref::<Int32Array>().unwrap();
 
-        let c = divide(&a, &b).unwrap();
+        let c = divide(a, b).unwrap();
         assert_eq!(6, c.len());
         assert_eq!(3, c.value(0));
-        assert_eq!(true, c.is_null(1));
+        assert!(c.is_null(1));
         assert_eq!(1, c.value(2));
         assert_eq!(0, c.value(3));
-        assert_eq!(true, c.is_null(4));
-        assert_eq!(true, c.is_null(5));
+        assert!(c.is_null(4));
+        assert!(c.is_null(5));
+    }
+
+    #[test]
+    fn test_primitive_array_modulus_with_nulls_sliced() {
+        let a = Int32Array::from(vec![
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(15),
+            None,
+            Some(8),
+            Some(1),
+            Some(9),
+            None,
+            None,
+        ]);
+        let b = Int32Array::from(vec![
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(5),
+            Some(6),
+            Some(8),
+            Some(9),
+            None,
+            None,
+            None,
+        ]);
+
+        let a = a.slice(8, 6);
+        let a = a.as_any().downcast_ref::<Int32Array>().unwrap();
+
+        let b = b.slice(8, 6);
+        let b = b.as_any().downcast_ref::<Int32Array>().unwrap();
+
+        let c = modulus(a, b).unwrap();
+        assert_eq!(6, c.len());
+        assert_eq!(0, c.value(0));
+        assert!(c.is_null(1));
+        assert_eq!(0, c.value(2));
+        assert_eq!(1, c.value(3));
+        assert!(c.is_null(4));
+        assert!(c.is_null(5));
     }
 
     #[test]
@@ -1469,7 +1542,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "ModulusByZero")]
+    #[should_panic(expected = "DivideByZero")]
     fn test_primitive_array_modulus_by_zero() {
         let a = Int32Array::from(vec![15]);
         let b = Int32Array::from(vec![0]);
@@ -1491,10 +1564,10 @@ mod tests {
         let a = Int32Array::from(vec![Some(5), None, Some(7), None]);
         let b = Int32Array::from(vec![None, None, Some(6), Some(7)]);
         let c = add(&a, &b).unwrap();
-        assert_eq!(true, c.is_null(0));
-        assert_eq!(true, c.is_null(1));
-        assert_eq!(false, c.is_null(2));
-        assert_eq!(true, c.is_null(3));
+        assert!(c.is_null(0));
+        assert!(c.is_null(1));
+        assert!(!c.is_null(2));
+        assert!(c.is_null(3));
         assert_eq!(13, c.value(2));
     }
 
@@ -1516,7 +1589,7 @@ mod tests {
         let b = b.slice(63, 65);
         let b = b.as_any().downcast_ref::<UInt8Array>().unwrap();
 
-        let actual = add(&a, &b).unwrap();
+        let actual = add(a, b).unwrap();
         let actual: Vec<Option<u8>> = actual.iter().collect();
         let expected: Vec<Option<u8>> = (63..63_u8 + 65_u8)
             .into_iter()

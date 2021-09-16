@@ -126,7 +126,7 @@ pub(crate) fn new_buffers(data_type: &DataType, capacity: usize) -> [MutableBuff
             buffer.push(0i64);
             [buffer, MutableBuffer::new(capacity * mem::size_of::<u8>())]
         }
-        DataType::List(_) => {
+        DataType::List(_) | DataType::Map(_, _) => {
             // offset buffer always starts with a zero
             let mut buffer = MutableBuffer::new((1 + capacity) * mem::size_of::<i32>());
             buffer.push(0i32);
@@ -354,20 +354,18 @@ impl ArrayData {
 
     /// Returns the total number of bytes of memory occupied physically by this [ArrayData].
     pub fn get_array_memory_size(&self) -> usize {
-        let mut size = 0;
-        // Calculate size of the fields that don't have [get_array_memory_size] method internally.
-        size += mem::size_of_val(self)
-            - mem::size_of_val(&self.buffers)
-            - mem::size_of_val(&self.null_bitmap)
-            - mem::size_of_val(&self.child_data);
+        let mut size = mem::size_of_val(self);
 
         // Calculate rest of the fields top down which contain actual data
         for buffer in &self.buffers {
-            size += mem::size_of_val(&buffer);
+            size += mem::size_of::<Buffer>();
             size += buffer.capacity();
         }
         if let Some(bitmap) = &self.null_bitmap {
-            size += bitmap.get_array_memory_size()
+            // this includes the size of the bitmap struct itself, since it is stored directly in
+            // this struct we already counted those bytes in the size_of_val(self) above
+            size += bitmap.get_array_memory_size();
+            size -= mem::size_of::<Bitmap>();
         }
         for child in &self.child_data {
             size += child.get_array_memory_size();
@@ -385,15 +383,36 @@ impl ArrayData {
     pub fn slice(&self, offset: usize, length: usize) -> ArrayData {
         assert!((offset + length) <= self.len());
 
-        let mut new_data = self.clone();
+        if let DataType::Struct(_) = self.data_type() {
+            // Slice into children
+            let new_offset = self.offset + offset;
+            let new_data = ArrayData {
+                data_type: self.data_type().clone(),
+                len: length,
+                null_count: count_nulls(self.null_buffer(), new_offset, length),
+                offset: new_offset,
+                buffers: self.buffers.clone(),
+                // Slice child data, to propagate offsets down to them
+                child_data: self
+                    .child_data()
+                    .iter()
+                    .map(|data| data.slice(offset, length))
+                    .collect(),
+                null_bitmap: self.null_bitmap().clone(),
+            };
 
-        new_data.len = length;
-        new_data.offset = offset + self.offset;
+            new_data
+        } else {
+            let mut new_data = self.clone();
 
-        new_data.null_count =
-            count_nulls(new_data.null_buffer(), new_data.offset, new_data.len);
+            new_data.len = length;
+            new_data.offset = offset + self.offset;
 
-        new_data
+            new_data.null_count =
+                count_nulls(new_data.null_buffer(), new_data.offset, new_data.len);
+
+            new_data
+        }
     }
 
     /// Returns the `buffer` as a slice of type `T` starting at self.offset
@@ -412,7 +431,7 @@ impl ArrayData {
     }
 
     /// Returns a new empty [ArrayData] valid for `data_type`.
-    pub(super) fn new_empty(data_type: &DataType) -> Self {
+    pub fn new_empty(data_type: &DataType) -> Self {
         let buffers = new_buffers(data_type, 0);
         let [buffer1, buffer2] = buffers;
         let buffers = into_buffers(data_type, buffer1, buffer2);
@@ -456,6 +475,9 @@ impl ArrayData {
                 .iter()
                 .map(|field| Self::new_empty(field.data_type()))
                 .collect(),
+            DataType::Map(field, _) => {
+                vec![Self::new_empty(field.data_type())]
+            }
             DataType::Union(_) => unimplemented!(),
             DataType::Dictionary(_, data_type) => {
                 vec![Self::new_empty(data_type)]
@@ -503,6 +525,11 @@ impl ArrayDataBuilder {
     #[allow(clippy::len_without_is_empty)]
     pub const fn len(mut self, n: usize) -> Self {
         self.len = n;
+        self
+    }
+
+    pub fn null_count(mut self, null_count: usize) -> Self {
+        self.null_count = Some(null_count);
         self
     }
 

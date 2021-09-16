@@ -17,7 +17,6 @@
 
 use std::convert::{From, TryInto};
 use std::fmt;
-use std::mem;
 use std::{any::Any, iter::FromIterator};
 
 use super::{
@@ -43,6 +42,8 @@ impl BinaryOffsetSizeTrait for i64 {
     const DATA_TYPE: DataType = DataType::LargeBinary;
 }
 
+/// See [`BinaryArray`] and [`LargeBinaryArray`] for storing
+/// binary data.
 pub struct GenericBinaryArray<OffsetSize: BinaryOffsetSizeTrait> {
     data: ArrayData,
     value_offsets: RawPtrBox<OffsetSize>,
@@ -175,7 +176,7 @@ impl<OffsetSize: BinaryOffsetSizeTrait> GenericBinaryArray<OffsetSize> {
 impl<'a, T: BinaryOffsetSizeTrait> GenericBinaryArray<T> {
     /// constructs a new iterator
     pub fn iter(&'a self) -> GenericBinaryIter<'a, T> {
-        GenericBinaryIter::<'a, T>::new(&self)
+        GenericBinaryIter::<'a, T>::new(self)
     }
 }
 
@@ -192,22 +193,12 @@ impl<OffsetSize: BinaryOffsetSizeTrait> fmt::Debug for GenericBinaryArray<Offset
 }
 
 impl<OffsetSize: BinaryOffsetSizeTrait> Array for GenericBinaryArray<OffsetSize> {
-    fn as_any(&self) -> &Any {
+    fn as_any(&self) -> &dyn Any {
         self
     }
 
     fn data(&self) -> &ArrayData {
         &self.data
-    }
-
-    /// Returns the total number of bytes of memory occupied by the buffers owned by this [$name].
-    fn get_buffer_memory_size(&self) -> usize {
-        self.data.get_buffer_memory_size()
-    }
-
-    /// Returns the total number of bytes of memory occupied physically by this [$name].
-    fn get_array_memory_size(&self) -> usize {
-        self.data.get_array_memory_size() + mem::size_of_val(self)
     }
 }
 
@@ -279,9 +270,80 @@ where
 }
 
 /// An array where each element is a byte whose maximum length is represented by a i32.
+///
+/// Examples
+///
+/// Create a BinaryArray from a vector of byte slices.
+///
+/// ```
+/// use arrow::array::{Array, BinaryArray};
+/// let values: Vec<&[u8]> =
+///     vec![b"one", b"two", b"", b"three"];
+/// let array = BinaryArray::from_vec(values);
+/// assert_eq!(4, array.len());
+/// assert_eq!(b"one", array.value(0));
+/// assert_eq!(b"two", array.value(1));
+/// assert_eq!(b"", array.value(2));
+/// assert_eq!(b"three", array.value(3));
+/// ```
+///
+/// Create a BinaryArray from a vector of Optional (null) byte slices.
+///
+/// ```
+/// use arrow::array::{Array, BinaryArray};
+/// let values: Vec<Option<&[u8]>> =
+///     vec![Some(b"one"), Some(b"two"), None, Some(b""), Some(b"three")];
+/// let array = BinaryArray::from_opt_vec(values);
+/// assert_eq!(5, array.len());
+/// assert_eq!(b"one", array.value(0));
+/// assert_eq!(b"two", array.value(1));
+/// assert_eq!(b"", array.value(3));
+/// assert_eq!(b"three", array.value(4));
+/// assert!(!array.is_null(0));
+/// assert!(!array.is_null(1));
+/// assert!(array.is_null(2));
+/// assert!(!array.is_null(3));
+/// assert!(!array.is_null(4));
+/// ```
+///
 pub type BinaryArray = GenericBinaryArray<i32>;
 
 /// An array where each element is a byte whose maximum length is represented by a i64.
+/// Examples
+///
+/// Create a LargeBinaryArray from a vector of byte slices.
+///
+/// ```
+/// use arrow::array::{Array, LargeBinaryArray};
+/// let values: Vec<&[u8]> =
+///     vec![b"one", b"two", b"", b"three"];
+/// let array = LargeBinaryArray::from_vec(values);
+/// assert_eq!(4, array.len());
+/// assert_eq!(b"one", array.value(0));
+/// assert_eq!(b"two", array.value(1));
+/// assert_eq!(b"", array.value(2));
+/// assert_eq!(b"three", array.value(3));
+/// ```
+///
+/// Create a LargeBinaryArray from a vector of Optional (null) byte slices.
+///
+/// ```
+/// use arrow::array::{Array, LargeBinaryArray};
+/// let values: Vec<Option<&[u8]>> =
+///     vec![Some(b"one"), Some(b"two"), None, Some(b""), Some(b"three")];
+/// let array = LargeBinaryArray::from_opt_vec(values);
+/// assert_eq!(5, array.len());
+/// assert_eq!(b"one", array.value(0));
+/// assert_eq!(b"two", array.value(1));
+/// assert_eq!(b"", array.value(3));
+/// assert_eq!(b"three", array.value(4));
+/// assert!(!array.is_null(0));
+/// assert!(!array.is_null(1));
+/// assert!(array.is_null(2));
+/// assert!(!array.is_null(3));
+/// assert!(!array.is_null(4));
+/// ```
+///
 pub type LargeBinaryArray = GenericBinaryArray<i64>;
 
 impl<'a, T: BinaryOffsetSizeTrait> IntoIterator for &'a GenericBinaryArray<T> {
@@ -316,6 +378,29 @@ impl<T: BinaryOffsetSizeTrait> From<GenericListArray<T>> for GenericBinaryArray<
 }
 
 /// A type of `FixedSizeListArray` whose elements are binaries.
+///
+/// # Examples
+///
+/// Create an array from an iterable argument of byte slices.
+///
+/// ```
+///    use arrow::array::{Array, FixedSizeBinaryArray};
+///    let input_arg = vec![ vec![1, 2], vec![3, 4], vec![5, 6] ];
+///    let arr = FixedSizeBinaryArray::try_from_iter(input_arg.into_iter()).unwrap();
+///
+///    assert_eq!(3, arr.len());
+///
+/// ```
+/// Create an array from an iterable argument of sparse byte slices.
+/// Sparsity means that the input argument can contain `None` items.
+/// ```
+///    use arrow::array::{Array, FixedSizeBinaryArray};
+///    let input_arg = vec![ None, Some(vec![7, 8]), Some(vec![9, 10]), None, Some(vec![13, 14]) ];
+///    let arr = FixedSizeBinaryArray::try_from_sparse_iter(input_arg.into_iter()).unwrap();
+///    assert_eq!(5, arr.len())
+///
+/// ```
+///
 pub struct FixedSizeBinaryArray {
     data: ArrayData,
     value_data: RawPtrBox<u8>,
@@ -364,7 +449,7 @@ impl FixedSizeBinaryArray {
     /// Sparsity means that items returned by the iterator are optional, i.e input argument can
     /// contain `None` items.
     ///
-    /// # Examles
+    /// # Examples
     ///
     /// ```
     /// use arrow::array::FixedSizeBinaryArray;
@@ -449,7 +534,7 @@ impl FixedSizeBinaryArray {
 
     /// Create an array from an iterable argument of byte slices.
     ///
-    /// # Examles
+    /// # Examples
     ///
     /// ```
     /// use arrow::array::FixedSizeBinaryArray;
@@ -570,26 +655,40 @@ impl fmt::Debug for FixedSizeBinaryArray {
 }
 
 impl Array for FixedSizeBinaryArray {
-    fn as_any(&self) -> &Any {
+    fn as_any(&self) -> &dyn Any {
         self
     }
 
     fn data(&self) -> &ArrayData {
         &self.data
     }
-
-    /// Returns the total number of bytes of memory occupied by the buffers owned by this [FixedSizeBinaryArray].
-    fn get_buffer_memory_size(&self) -> usize {
-        self.data.get_buffer_memory_size()
-    }
-
-    /// Returns the total number of bytes of memory occupied physically by this [FixedSizeBinaryArray].
-    fn get_array_memory_size(&self) -> usize {
-        self.data.get_array_memory_size() + mem::size_of_val(self)
-    }
 }
 
 /// A type of `DecimalArray` whose elements are binaries.
+///
+/// # Examples
+///
+/// ```
+///    use arrow::array::{Array, DecimalArray, DecimalBuilder};
+///    use arrow::datatypes::DataType;
+///    let mut builder = DecimalBuilder::new(30, 23, 6);
+///
+///    builder.append_value(8_887_000_000).unwrap();
+///    builder.append_null().unwrap();
+///    builder.append_value(-8_887_000_000).unwrap();
+///    let decimal_array: DecimalArray = builder.finish();
+///
+///    assert_eq!(&DataType::Decimal(23, 6), decimal_array.data_type());
+///    assert_eq!(8_887_000_000, decimal_array.value(0));
+///    assert_eq!("8887.000000", decimal_array.value_as_string(0));
+///    assert_eq!(3, decimal_array.len());
+///    assert_eq!(1, decimal_array.null_count());
+///    assert_eq!(32, decimal_array.value_offset(2));
+///    assert_eq!(16, decimal_array.value_length());
+///    assert_eq!(23, decimal_array.precision());
+///    assert_eq!(6, decimal_array.scale());
+/// ```
+///
 pub struct DecimalArray {
     data: ArrayData,
     value_data: RawPtrBox<u8>,
@@ -641,6 +740,27 @@ impl DecimalArray {
     #[inline]
     fn value_offset_at(&self, i: usize) -> i32 {
         self.length * i as i32
+    }
+
+    #[inline]
+    pub fn value_as_string(&self, row: usize) -> String {
+        let value = self.value(row);
+        let value_str = value.to_string();
+
+        if self.scale == 0 {
+            value_str
+        } else {
+            let (sign, rest) = value_str.split_at(if value >= 0 { 0 } else { 1 });
+
+            if rest.len() > self.scale {
+                // Decimal separator is in the middle of the string
+                let (whole, decimal) = value_str.split_at(value_str.len() - self.scale);
+                format!("{}.{}", whole, decimal)
+            } else {
+                // String has to be padded
+                format!("{}0.{:0>width$}", sign, rest, width = self.scale)
+            }
+        }
     }
 
     pub fn from_fixed_size_list_array(
@@ -706,36 +826,28 @@ impl fmt::Debug for DecimalArray {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "DecimalArray<{}, {}>\n[\n", self.precision, self.scale)?;
         print_long_array(self, f, |array, index, f| {
-            fmt::Debug::fmt(&array.value(index), f)
+            let formatted_decimal = array.value_as_string(index);
+
+            write!(f, "{}", formatted_decimal)
         })?;
         write!(f, "]")
     }
 }
 
 impl Array for DecimalArray {
-    fn as_any(&self) -> &Any {
+    fn as_any(&self) -> &dyn Any {
         self
     }
 
     fn data(&self) -> &ArrayData {
         &self.data
     }
-
-    /// Returns the total number of bytes of memory occupied by the buffers owned by this [DecimalArray].
-    fn get_buffer_memory_size(&self) -> usize {
-        self.data.get_buffer_memory_size()
-    }
-
-    /// Returns the total number of bytes of memory occupied physically by this [DecimalArray].
-    fn get_array_memory_size(&self) -> usize {
-        self.data.get_array_memory_size() + mem::size_of_val(self)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::{
-        array::{LargeListArray, ListArray},
+        array::{DecimalBuilder, LargeListArray, ListArray},
         datatypes::Field,
     };
 
@@ -949,11 +1061,11 @@ mod tests {
         assert_eq!(array.value(1), b"two");
         assert_eq!(array.value(3), b"");
         assert_eq!(array.value(4), b"three");
-        assert_eq!(array.is_null(0), false);
-        assert_eq!(array.is_null(1), false);
-        assert_eq!(array.is_null(2), true);
-        assert_eq!(array.is_null(3), false);
-        assert_eq!(array.is_null(4), false);
+        assert!(!array.is_null(0));
+        assert!(!array.is_null(1));
+        assert!(array.is_null(2));
+        assert!(!array.is_null(3));
+        assert!(!array.is_null(4));
     }
 
     #[test]
@@ -1139,19 +1251,59 @@ mod tests {
     }
 
     #[test]
+    fn test_decimal_array_value_as_string() {
+        let mut decimal_builder = DecimalBuilder::new(7, 5, 3);
+        for value in [123450, -123450, 100, -100, 10, -10, 0] {
+            decimal_builder.append_value(value).unwrap();
+        }
+        let arr = decimal_builder.finish();
+
+        assert_eq!("123.450", arr.value_as_string(0));
+        assert_eq!("-123.450", arr.value_as_string(1));
+        assert_eq!("0.100", arr.value_as_string(2));
+        assert_eq!("-0.100", arr.value_as_string(3));
+        assert_eq!("0.010", arr.value_as_string(4));
+        assert_eq!("-0.010", arr.value_as_string(5));
+        assert_eq!("0.000", arr.value_as_string(6));
+    }
+
+    #[test]
     fn test_decimal_array_fmt_debug() {
-        let values: [u8; 32] = [
-            192, 219, 180, 17, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 64, 36, 75, 238, 253,
-            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-        ];
-        let array_data = ArrayData::builder(DataType::Decimal(23, 6))
-            .len(2)
-            .add_buffer(Buffer::from(&values[..]))
-            .build();
-        let arr = DecimalArray::from(array_data);
+        let values: Vec<i128> = vec![8887000000, -8887000000];
+        let mut decimal_builder = DecimalBuilder::new(3, 23, 6);
+
+        values.iter().for_each(|&value| {
+            decimal_builder.append_value(value).unwrap();
+        });
+        decimal_builder.append_null().unwrap();
+        let arr = decimal_builder.finish();
         assert_eq!(
-            "DecimalArray<23, 6>\n[\n  8887000000,\n  -8887000000,\n]",
+            "DecimalArray<23, 6>\n[\n  8887.000000,\n  -8887.000000,\n  null,\n]",
             format!("{:?}", arr)
         );
+    }
+
+    #[test]
+    fn test_fixed_size_binary_array_from_iter() {
+        let input_arg = vec![vec![1, 2], vec![3, 4], vec![5, 6]];
+        let arr = FixedSizeBinaryArray::try_from_iter(input_arg.into_iter()).unwrap();
+
+        assert_eq!(2, arr.value_length());
+        assert_eq!(3, arr.len())
+    }
+
+    #[test]
+    fn test_fixed_size_binary_array_from_sparse_iter() {
+        let input_arg = vec![
+            None,
+            Some(vec![7, 8]),
+            Some(vec![9, 10]),
+            None,
+            Some(vec![13, 14]),
+        ];
+        let arr =
+            FixedSizeBinaryArray::try_from_sparse_iter(input_arg.into_iter()).unwrap();
+        assert_eq!(2, arr.value_length());
+        assert_eq!(5, arr.len())
     }
 }

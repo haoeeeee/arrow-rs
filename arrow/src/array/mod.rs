@@ -87,6 +87,7 @@ mod array_binary;
 mod array_boolean;
 mod array_dictionary;
 mod array_list;
+mod array_map;
 mod array_primitive;
 mod array_string;
 mod array_struct;
@@ -122,6 +123,7 @@ pub use self::array_dictionary::DictionaryArray;
 pub use self::array_list::FixedSizeListArray;
 pub use self::array_list::LargeListArray;
 pub use self::array_list::ListArray;
+pub use self::array_map::MapArray;
 pub use self::array_primitive::PrimitiveArray;
 pub use self::array_string::LargeStringArray;
 pub use self::array_string::StringArray;
@@ -256,7 +258,7 @@ pub type DurationMillisecondBuilder = PrimitiveBuilder<DurationMillisecondType>;
 pub type DurationMicrosecondBuilder = PrimitiveBuilder<DurationMicrosecondType>;
 pub type DurationNanosecondBuilder = PrimitiveBuilder<DurationNanosecondType>;
 
-pub use self::transform::MutableArrayData;
+pub use self::transform::{Capacities, MutableArrayData};
 
 // --------------------- Array Iterator ---------------------
 
@@ -273,9 +275,9 @@ pub use self::ord::{build_compare, DynComparator};
 // --------------------- Array downcast helper functions ---------------------
 
 pub use self::cast::{
-    as_boolean_array, as_dictionary_array, as_generic_list_array, as_large_list_array,
-    as_largestring_array, as_list_array, as_null_array, as_primitive_array,
-    as_string_array, as_struct_array,
+    as_boolean_array, as_dictionary_array, as_generic_binary_array,
+    as_generic_list_array, as_large_list_array, as_largestring_array, as_list_array,
+    as_null_array, as_primitive_array, as_string_array, as_struct_array,
 };
 
 // ------------------------------ C Data Interface ---------------------------

@@ -31,14 +31,35 @@
 //! ```
 
 use crate::array::*;
+use crate::datatypes::DataType;
 use crate::error::{ArrowError, Result};
 
+fn compute_str_values_length<Offset: StringOffsetSizeTrait>(
+    arrays: &[&ArrayData],
+) -> usize {
+    arrays
+        .iter()
+        .map(|&data| {
+            // get the length of the value buffer
+            let buf_len = data.buffers()[1].len();
+            // find the offset of the buffer
+            // this returns a slice of offsets, starting from the offset of the array
+            // so we can take the first value
+            let offset = data.buffer::<Offset>(0)[0];
+            buf_len - offset.to_usize().unwrap()
+        })
+        .sum()
+}
+
 /// Concatenate multiple [Array] of the same type into a single [ArrayRef].
-pub fn concat(arrays: &[&Array]) -> Result<ArrayRef> {
+pub fn concat(arrays: &[&dyn Array]) -> Result<ArrayRef> {
     if arrays.is_empty() {
         return Err(ArrowError::ComputeError(
             "concat requires input of at least one array".to_string(),
         ));
+    } else if arrays.len() == 1 {
+        let array = arrays[0];
+        return Ok(array.slice(0, array.len()));
     }
 
     if arrays
@@ -56,7 +77,25 @@ pub fn concat(arrays: &[&Array]) -> Result<ArrayRef> {
 
     let arrays = arrays.iter().map(|a| a.data()).collect::<Vec<_>>();
 
-    let mut mutable = MutableArrayData::new(arrays, false, capacity);
+    let mut mutable = match arrays[0].data_type() {
+        DataType::Utf8 => {
+            let str_values_size = compute_str_values_length::<i32>(&arrays);
+            MutableArrayData::with_capacities(
+                arrays,
+                false,
+                Capacities::Binary(capacity, Some(str_values_size)),
+            )
+        }
+        DataType::LargeUtf8 => {
+            let str_values_size = compute_str_values_length::<i64>(&arrays);
+            MutableArrayData::with_capacities(
+                arrays,
+                false,
+                Capacities::Binary(capacity, Some(str_values_size)),
+            )
+        }
+        _ => MutableArrayData::new(arrays, false, capacity),
+    };
 
     for (i, len) in lengths.iter().enumerate() {
         mutable.extend(i, 0, *len)
@@ -75,6 +114,21 @@ mod tests {
     fn test_concat_empty_vec() {
         let re = concat(&[]);
         assert!(re.is_err());
+    }
+
+    #[test]
+    fn test_concat_one_element_vec() -> Result<()> {
+        let arr = Arc::new(PrimitiveArray::<Int64Type>::from(vec![
+            Some(-1),
+            Some(2),
+            None,
+        ])) as ArrayRef;
+        let result = concat(&[arr.as_ref()])?;
+        assert_eq!(
+            &arr, &result,
+            "concatenating single element array gives back the same result"
+        );
+        Ok(())
     }
 
     #[test]
@@ -451,5 +505,24 @@ mod tests {
 
         let concat = concat_dictionary(input_1, input_2);
         assert_eq!(concat, expected);
+    }
+
+    #[test]
+    fn test_concat_string_sizes() -> Result<()> {
+        let a: LargeStringArray = ((0..150).map(|_| Some("foo"))).collect();
+        let b: LargeStringArray = ((0..150).map(|_| Some("foo"))).collect();
+        let c = LargeStringArray::from(vec![Some("foo"), Some("bar"), None, Some("baz")]);
+        // 150 * 3 = 450
+        // 150 * 3 = 450
+        // 3 * 3   = 9
+        // ------------+
+        // 909
+        // closest 64 byte aligned cap = 960
+
+        let arr = concat(&[&a, &b, &c])?;
+        // this would have been 1280 if we did not precompute the value lengths.
+        assert_eq!(arr.data().buffers()[1].capacity(), 960);
+
+        Ok(())
     }
 }

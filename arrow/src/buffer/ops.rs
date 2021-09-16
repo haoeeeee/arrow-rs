@@ -33,7 +33,7 @@ use super::{Buffer, MutableBuffer};
 /// and the `scalar_op` gets applied to remaining bytes.
 /// Contrary to the non-simd version `bitwise_bin_op_helper`, the offset and length is specified in bytes
 /// and this version does not support operations starting at arbitrary bit offsets.
-#[cfg(simd)]
+#[cfg(feature = "simd")]
 pub fn bitwise_bin_op_simd_helper<F_SIMD, F_SCALAR>(
     left: &Buffer,
     left_offset: usize,
@@ -82,7 +82,7 @@ where
 /// and the `scalar_op` gets applied to remaining bytes.
 /// Contrary to the non-simd version `bitwise_unary_op_helper`, the offset and length is specified in bytes
 /// and this version does not support operations starting at arbitrary bit offsets.
-#[cfg(simd)]
+#[cfg(feature = "simd")]
 pub fn bitwise_unary_op_simd_helper<F_SIMD, F_SCALAR>(
     left: &Buffer,
     left_offset: usize,
@@ -287,7 +287,7 @@ pub fn buffer_bin_and(
     len_in_bits: usize,
 ) -> Buffer {
     bitwise_bin_op_helper(
-        &left,
+        left,
         left_offset_in_bits,
         right,
         right_offset_in_bits,
@@ -396,7 +396,7 @@ pub fn buffer_bin_or(
     len_in_bits: usize,
 ) -> Buffer {
     bitwise_bin_op_helper(
-        &left,
+        left,
         left_offset_in_bits,
         right,
         right_offset_in_bits,
@@ -411,7 +411,7 @@ pub fn buffer_unary_not(
     len_in_bits: usize,
 ) -> Buffer {
     // SIMD implementation if available and byte-aligned
-    #[cfg(simd)]
+    #[cfg(feature = "simd")]
     if offset_in_bits % 8 == 0 && len_in_bits % 8 == 0 {
         return bitwise_unary_op_simd_helper(
             &left,
@@ -424,6 +424,6 @@ pub fn buffer_unary_not(
     // Default implementation
     #[allow(unreachable_code)]
     {
-        bitwise_unary_op_helper(&left, offset_in_bits, len_in_bits, |a| !a)
+        bitwise_unary_op_helper(left, offset_in_bits, len_in_bits, |a| !a)
     }
 }

@@ -17,13 +17,15 @@
 
 //! Defines miscellaneous array kernels.
 
+use crate::buffer::buffer_bin_and;
+use crate::datatypes::DataType;
 use crate::error::Result;
 use crate::record_batch::RecordBatch;
 use crate::{array::*, util::bit_chunk_iterator::BitChunkIterator};
 use std::iter::Enumerate;
 
 /// Function that can filter arbitrary arrays
-pub type Filter<'a> = Box<Fn(&ArrayData) -> ArrayData + 'a>;
+pub type Filter<'a> = Box<dyn Fn(&ArrayData) -> ArrayData + 'a>;
 
 /// Internal state of [SlicesIterator]
 #[derive(Debug, PartialEq)]
@@ -42,10 +44,10 @@ enum State {
 /// slots of a [BooleanArray] are true. Each interval corresponds to a contiguous region of memory to be
 /// "taken" from an array to be filtered.
 #[derive(Debug)]
-pub(crate) struct SlicesIterator<'a> {
+pub struct SlicesIterator<'a> {
     iter: Enumerate<BitChunkIterator<'a>>,
     state: State,
-    filter_count: usize,
+    filter: &'a BooleanArray,
     remainder_mask: u64,
     remainder_len: usize,
     chunk_len: usize,
@@ -57,19 +59,14 @@ pub(crate) struct SlicesIterator<'a> {
 }
 
 impl<'a> SlicesIterator<'a> {
-    pub(crate) fn new(filter: &'a BooleanArray) -> Self {
+    pub fn new(filter: &'a BooleanArray) -> Self {
         let values = &filter.data_ref().buffers()[0];
-
-        // this operation is performed before iteration
-        // because it is fast and allows reserving all the needed memory
-        let filter_count = values.count_set_bits_offset(filter.offset(), filter.len());
-
         let chunks = values.bit_chunks(filter.offset(), filter.len());
 
         Self {
             iter: chunks.iter().enumerate(),
             state: State::Chunks,
-            filter_count,
+            filter,
             remainder_len: chunks.remainder_len(),
             chunk_len: chunks.chunk_len(),
             remainder_mask: chunks.remainder_bits(),
@@ -79,6 +76,12 @@ impl<'a> SlicesIterator<'a> {
             current_chunk: 0,
             current_bit: 0,
         }
+    }
+
+    /// Counts the number of set bits in the filter array.
+    fn filter_count(&self) -> usize {
+        let values = self.filter.values();
+        values.count_set_bits_offset(self.filter.offset(), self.filter.len())
     }
 
     #[inline]
@@ -191,21 +194,43 @@ impl<'a> Iterator for SlicesIterator<'a> {
 /// Therefore, it is considered undefined behavior to pass `filter` with null values.
 pub fn build_filter(filter: &BooleanArray) -> Result<Filter> {
     let iter = SlicesIterator::new(filter);
-    let filter_count = iter.filter_count;
+    let filter_count = iter.filter_count();
     let chunks = iter.collect::<Vec<_>>();
 
     Ok(Box::new(move |array: &ArrayData| {
-        let mut mutable = MutableArrayData::new(vec![array], false, filter_count);
-        chunks
-            .iter()
-            .for_each(|(start, end)| mutable.extend(0, *start, *end));
-        mutable.freeze()
+        match filter_count {
+            // return all
+            len if len == array.len() => array.clone(),
+            0 => ArrayData::new_empty(array.data_type()),
+            _ => {
+                let mut mutable = MutableArrayData::new(vec![array], false, filter_count);
+                chunks
+                    .iter()
+                    .for_each(|(start, end)| mutable.extend(0, *start, *end));
+                mutable.freeze()
+            }
+        }
     }))
 }
 
+/// Remove null values by do a bitmask AND operation with null bits and the boolean bits.
+pub fn prep_null_mask_filter(filter: &BooleanArray) -> BooleanArray {
+    let array_data = filter.data_ref();
+    let null_bitmap = array_data.null_buffer().unwrap();
+    let mask = filter.values();
+    let offset = filter.offset();
+
+    let new_mask = buffer_bin_and(mask, offset, null_bitmap, offset, filter.len());
+
+    let array_data = ArrayData::builder(DataType::Boolean)
+        .len(filter.len())
+        .add_buffer(new_mask)
+        .build();
+    BooleanArray::from(array_data)
+}
+
 /// Filters an [Array], returning elements matching the filter (i.e. where the values are true).
-/// WARNING: the nulls of `filter` are ignored and the value on its slot is considered.
-/// Therefore, it is considered undefined behavior to pass `filter` with null values.
+///
 /// # Example
 /// ```rust
 /// # use arrow::array::{Int32Array, BooleanArray};
@@ -220,35 +245,71 @@ pub fn build_filter(filter: &BooleanArray) -> Result<Filter> {
 /// # Ok(())
 /// # }
 /// ```
-pub fn filter(array: &Array, filter: &BooleanArray) -> Result<ArrayRef> {
-    let iter = SlicesIterator::new(filter);
+pub fn filter(array: &dyn Array, predicate: &BooleanArray) -> Result<ArrayRef> {
+    if predicate.null_count() > 0 {
+        // this greatly simplifies subsequent filtering code
+        // now we only have a boolean mask to deal with
+        let predicate = prep_null_mask_filter(predicate);
+        return filter(array, &predicate);
+    }
 
-    let mut mutable =
-        MutableArrayData::new(vec![array.data_ref()], false, iter.filter_count);
-    iter.for_each(|(start, end)| mutable.extend(0, start, end));
-    let data = mutable.freeze();
-    Ok(make_array(data))
+    let iter = SlicesIterator::new(predicate);
+    let filter_count = iter.filter_count();
+    match filter_count {
+        0 => {
+            // return empty
+            Ok(new_empty_array(array.data_type()))
+        }
+        len if len == array.len() => {
+            // return all
+            let data = array.data().clone();
+            Ok(make_array(data))
+        }
+        _ => {
+            // actually filter
+            let mut mutable =
+                MutableArrayData::new(vec![array.data_ref()], false, filter_count);
+            iter.for_each(|(start, end)| mutable.extend(0, start, end));
+            let data = mutable.freeze();
+            Ok(make_array(data))
+        }
+    }
 }
 
 /// Returns a new [RecordBatch] with arrays containing only values matching the filter.
-/// WARNING: the nulls of `filter` are ignored and the value on its slot is considered.
-/// Therefore, it is considered undefined behavior to pass `filter` with null values.
 pub fn filter_record_batch(
     record_batch: &RecordBatch,
-    filter: &BooleanArray,
+    predicate: &BooleanArray,
 ) -> Result<RecordBatch> {
-    let filter = build_filter(filter)?;
-    let filtered_arrays = record_batch
-        .columns()
-        .iter()
-        .map(|a| make_array(filter(&a.data())))
-        .collect();
+    if predicate.null_count() > 0 {
+        // this greatly simplifies subsequent filtering code
+        // now we only have a boolean mask to deal with
+        let predicate = prep_null_mask_filter(predicate);
+        return filter_record_batch(record_batch, &predicate);
+    }
+
+    let num_colums = record_batch.columns().len();
+
+    let filtered_arrays = match num_colums {
+        1 => {
+            vec![filter(record_batch.columns()[0].as_ref(), predicate)?]
+        }
+        _ => {
+            let filter = build_filter(predicate)?;
+            record_batch
+                .columns()
+                .iter()
+                .map(|a| make_array(filter(a.data())))
+                .collect()
+        }
+    };
     RecordBatch::try_new(record_batch.schema(), filtered_arrays)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::datatypes::Int64Type;
     use crate::{
         buffer::Buffer,
         datatypes::{DataType, Field},
@@ -392,9 +453,9 @@ mod tests {
         assert_eq!(67, d.len());
         assert_eq!(3, d.null_count());
         assert_eq!(1, d.value(0));
-        assert_eq!(true, d.is_null(1));
+        assert!(d.is_null(1));
         assert_eq!(64, d.value(63));
-        assert_eq!(true, d.is_null(64));
+        assert!(d.is_null(64));
         assert_eq!(67, d.value(65));
     }
 
@@ -416,7 +477,7 @@ mod tests {
         let c = filter(&a, &b).unwrap();
         let d = c.as_ref().as_any().downcast_ref::<Int32Array>().unwrap();
         assert_eq!(1, d.len());
-        assert_eq!(true, d.is_null(0));
+        assert!(d.is_null(0));
     }
 
     #[test]
@@ -427,8 +488,8 @@ mod tests {
         let d = c.as_ref().as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(2, d.len());
         assert_eq!("hello", d.value(0));
-        assert_eq!(false, d.is_null(0));
-        assert_eq!(true, d.is_null(1));
+        assert!(!d.is_null(0));
+        assert!(d.is_null(1));
     }
 
     #[test]
@@ -440,8 +501,8 @@ mod tests {
         let d = c.as_ref().as_any().downcast_ref::<BinaryArray>().unwrap();
         assert_eq!(2, d.len());
         assert_eq!(b"hello", d.value(0));
-        assert_eq!(false, d.is_null(0));
-        assert_eq!(true, d.is_null(1));
+        assert!(!d.is_null(0));
+        assert!(d.is_null(1));
     }
 
     #[test]
@@ -456,8 +517,8 @@ mod tests {
         let c = filter(a, &b).unwrap();
         let d = c.as_ref().as_any().downcast_ref::<Int32Array>().unwrap();
         assert_eq!(2, d.len());
-        assert_eq!(true, d.is_null(0));
-        assert_eq!(false, d.is_null(1));
+        assert!(d.is_null(0));
+        assert!(!d.is_null(1));
         assert_eq!(9, d.value(1));
     }
 
@@ -478,7 +539,7 @@ mod tests {
         assert_eq!(3, values.len());
         // but keys are filtered
         assert_eq!(2, d.len());
-        assert_eq!(true, d.is_null(0));
+        assert!(d.is_null(0));
         assert_eq!("world", values.value(d.keys().value(1) as usize));
     }
 
@@ -549,7 +610,7 @@ mod tests {
         let filter = BooleanArray::from(filter_values);
 
         let iter = SlicesIterator::new(&filter);
-        let filter_count = iter.filter_count;
+        let filter_count = iter.filter_count();
         let chunks = iter.collect::<Vec<_>>();
 
         assert_eq!(chunks, vec![(1, 2)]);
@@ -562,7 +623,7 @@ mod tests {
         let filter = BooleanArray::from(filter_values);
 
         let iter = SlicesIterator::new(&filter);
-        let filter_count = iter.filter_count;
+        let filter_count = iter.filter_count();
         let chunks = iter.collect::<Vec<_>>();
 
         assert_eq!(chunks, vec![(0, 1), (2, 64)]);
@@ -575,10 +636,55 @@ mod tests {
         let filter = BooleanArray::from(filter_values);
 
         let iter = SlicesIterator::new(&filter);
-        let filter_count = iter.filter_count;
+        let filter_count = iter.filter_count();
         let chunks = iter.collect::<Vec<_>>();
 
         assert_eq!(chunks, vec![(1, 62), (63, 124), (125, 130)]);
         assert_eq!(filter_count, 61 + 61 + 5);
+    }
+
+    #[test]
+    fn test_null_mask() -> Result<()> {
+        use crate::compute::kernels::comparison;
+        let a: PrimitiveArray<Int64Type> =
+            PrimitiveArray::from(vec![Some(1), Some(2), None]);
+        let mask0 = comparison::eq(&a, &a)?;
+        let out0 = filter(&a, &mask0)?;
+        let out_arr0 = out0
+            .as_any()
+            .downcast_ref::<PrimitiveArray<Int64Type>>()
+            .unwrap();
+
+        let mask1 = BooleanArray::from(vec![Some(true), Some(true), None]);
+        let out1 = filter(&a, &mask1)?;
+        let out_arr1 = out1
+            .as_any()
+            .downcast_ref::<PrimitiveArray<Int64Type>>()
+            .unwrap();
+        assert_eq!(mask0, mask1);
+        assert_eq!(out_arr0, out_arr1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_fast_path() -> Result<()> {
+        let a: PrimitiveArray<Int64Type> =
+            PrimitiveArray::from(vec![Some(1), Some(2), None]);
+
+        // all true
+        let mask = BooleanArray::from(vec![true, true, true]);
+        let out = filter(&a, &mask)?;
+        let b = out
+            .as_any()
+            .downcast_ref::<PrimitiveArray<Int64Type>>()
+            .unwrap();
+        assert_eq!(&a, b);
+
+        // all false
+        let mask = BooleanArray::from(vec![false, false, false]);
+        let out = filter(&a, &mask)?;
+        assert_eq!(out.len(), 0);
+        assert_eq!(out.data_type(), &DataType::Int64);
+        Ok(())
     }
 }

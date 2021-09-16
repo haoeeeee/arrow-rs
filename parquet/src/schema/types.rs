@@ -72,8 +72,8 @@ impl Type {
     /// Returns [`BasicTypeInfo`] information about the type.
     pub fn get_basic_info(&self) -> &BasicTypeInfo {
         match *self {
-            Type::PrimitiveType { ref basic_info, .. } => &basic_info,
-            Type::GroupType { ref basic_info, .. } => &basic_info,
+            Type::PrimitiveType { ref basic_info, .. } => basic_info,
+            Type::GroupType { ref basic_info, .. } => basic_info,
         }
     }
 
@@ -757,11 +757,13 @@ impl ColumnDescriptor {
     }
 
     /// Returns maximum definition level for this column.
+    #[inline]
     pub fn max_def_level(&self) -> i16 {
         self.max_def_level
     }
 
     /// Returns maximum repetition level for this column.
+    #[inline]
     pub fn max_rep_level(&self) -> i16 {
         self.max_rep_level
     }

@@ -62,7 +62,7 @@ pub unsafe fn get_bit_raw(data: *const u8, i: usize) -> bool {
     (*data.add(i >> 3) & BIT_MASK[i & 7]) != 0
 }
 
-/// Sets bit at position `i` for `data`
+/// Sets bit at position `i` for `data` to 1
 #[inline]
 pub fn set_bit(data: &mut [u8], i: usize) {
     data[i >> 3] |= BIT_MASK[i & 7];
@@ -114,7 +114,7 @@ pub fn ceil(value: usize, divisor: usize) -> usize {
 /// Note that each slice should be 64 bytes and it is the callers responsibility to ensure
 /// that this is the case.  If passed slices larger than 64 bytes the operation will only
 /// be performed on the first 64 bytes.  Slices less than 64 bytes will panic.
-#[cfg(simd)]
+#[cfg(feature = "simd")]
 pub unsafe fn bitwise_bin_op_simd<F>(left: &[u8], right: &[u8], result: &mut [u8], op: F)
 where
     F: Fn(u8x64, u8x64) -> u8x64,
@@ -125,7 +125,7 @@ where
     simd_result.write_to_slice_unaligned_unchecked(result);
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test_utils"))]
 mod tests {
     use std::collections::HashSet;
 
@@ -146,28 +146,28 @@ mod tests {
     #[test]
     fn test_get_bit() {
         // 00001101
-        assert_eq!(true, get_bit(&[0b00001101], 0));
-        assert_eq!(false, get_bit(&[0b00001101], 1));
-        assert_eq!(true, get_bit(&[0b00001101], 2));
-        assert_eq!(true, get_bit(&[0b00001101], 3));
+        assert!(get_bit(&[0b00001101], 0));
+        assert!(!get_bit(&[0b00001101], 1));
+        assert!(get_bit(&[0b00001101], 2));
+        assert!(get_bit(&[0b00001101], 3));
 
         // 01001001 01010010
-        assert_eq!(true, get_bit(&[0b01001001, 0b01010010], 0));
-        assert_eq!(false, get_bit(&[0b01001001, 0b01010010], 1));
-        assert_eq!(false, get_bit(&[0b01001001, 0b01010010], 2));
-        assert_eq!(true, get_bit(&[0b01001001, 0b01010010], 3));
-        assert_eq!(false, get_bit(&[0b01001001, 0b01010010], 4));
-        assert_eq!(false, get_bit(&[0b01001001, 0b01010010], 5));
-        assert_eq!(true, get_bit(&[0b01001001, 0b01010010], 6));
-        assert_eq!(false, get_bit(&[0b01001001, 0b01010010], 7));
-        assert_eq!(false, get_bit(&[0b01001001, 0b01010010], 8));
-        assert_eq!(true, get_bit(&[0b01001001, 0b01010010], 9));
-        assert_eq!(false, get_bit(&[0b01001001, 0b01010010], 10));
-        assert_eq!(false, get_bit(&[0b01001001, 0b01010010], 11));
-        assert_eq!(true, get_bit(&[0b01001001, 0b01010010], 12));
-        assert_eq!(false, get_bit(&[0b01001001, 0b01010010], 13));
-        assert_eq!(true, get_bit(&[0b01001001, 0b01010010], 14));
-        assert_eq!(false, get_bit(&[0b01001001, 0b01010010], 15));
+        assert!(get_bit(&[0b01001001, 0b01010010], 0));
+        assert!(!get_bit(&[0b01001001, 0b01010010], 1));
+        assert!(!get_bit(&[0b01001001, 0b01010010], 2));
+        assert!(get_bit(&[0b01001001, 0b01010010], 3));
+        assert!(!get_bit(&[0b01001001, 0b01010010], 4));
+        assert!(!get_bit(&[0b01001001, 0b01010010], 5));
+        assert!(get_bit(&[0b01001001, 0b01010010], 6));
+        assert!(!get_bit(&[0b01001001, 0b01010010], 7));
+        assert!(!get_bit(&[0b01001001, 0b01010010], 8));
+        assert!(get_bit(&[0b01001001, 0b01010010], 9));
+        assert!(!get_bit(&[0b01001001, 0b01010010], 10));
+        assert!(!get_bit(&[0b01001001, 0b01010010], 11));
+        assert!(get_bit(&[0b01001001, 0b01010010], 12));
+        assert!(!get_bit(&[0b01001001, 0b01010010], 13));
+        assert!(get_bit(&[0b01001001, 0b01010010], 14));
+        assert!(!get_bit(&[0b01001001, 0b01010010], 15));
     }
 
     #[test]
@@ -271,7 +271,7 @@ mod tests {
         let mut v = HashSet::new();
         let mut rng = seedable_rng();
         for _ in 0..NUM_SETS {
-            let offset = rng.gen_range(0, 8 * NUM_BYTES);
+            let offset = rng.gen_range(0..8 * NUM_BYTES);
             v.insert(offset);
             set_bit(&mut buffer[..], offset);
         }
@@ -297,7 +297,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(simd)]
+    #[cfg(feature = "simd")]
     fn test_bitwise_and_simd() {
         let buf1 = [0b00110011u8; 64];
         let buf2 = [0b11110000u8; 64];
@@ -309,7 +309,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(simd)]
+    #[cfg(feature = "simd")]
     fn test_bitwise_or_simd() {
         let buf1 = [0b00110011u8; 64];
         let buf2 = [0b11110000u8; 64];

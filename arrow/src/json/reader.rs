@@ -43,11 +43,11 @@
 //! ```
 
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
-use std::iter::FromIterator;
 use std::sync::Arc;
 
 use indexmap::map::IndexMap as HashMap;
 use indexmap::set::IndexSet as HashSet;
+use serde_json::json;
 use serde_json::{map::Map as JsonMap, Value};
 
 use crate::buffer::MutableBuffer;
@@ -927,8 +927,16 @@ impl Decoder {
             rows.iter()
                 .map(|row| {
                     row.get(&col_name)
-                        .and_then(|value| value.as_f64())
-                        .and_then(num::cast::cast)
+                        .and_then(|value| {
+                            if value.is_i64() {
+                                value.as_i64().map(num::cast::cast)
+                            } else if value.is_u64() {
+                                value.as_u64().map(num::cast::cast)
+                            } else {
+                                value.as_f64().map(num::cast::cast)
+                            }
+                        })
+                        .flatten()
                 })
                 .collect::<PrimitiveArray<T>>(),
         ))
@@ -1018,16 +1026,16 @@ impl Decoder {
                     "Temporal types are not yet supported, see ARROW-4803".to_string(),
                 ))
             }
-            DataType::Utf8 => {
-                StringArray::from_iter(flatten_json_string_values(rows).into_iter())
-                    .data()
-                    .clone()
-            }
-            DataType::LargeUtf8 => {
-                LargeStringArray::from_iter(flatten_json_string_values(rows).into_iter())
-                    .data()
-                    .clone()
-            }
+            DataType::Utf8 => flatten_json_string_values(rows)
+                .into_iter()
+                .collect::<StringArray>()
+                .data()
+                .clone(),
+            DataType::LargeUtf8 => flatten_json_string_values(rows)
+                .into_iter()
+                .collect::<LargeStringArray>()
+                .data()
+                .clone(),
             DataType::List(field) => {
                 let child = self
                     .build_nested_list_array::<i32>(&flatten_json_values(rows), field)?;
@@ -1217,6 +1225,14 @@ impl Decoder {
                             })
                             .collect::<StringArray>(),
                     ) as ArrayRef),
+                    DataType::Binary => Ok(Arc::new(
+                        rows.iter()
+                            .map(|row| {
+                                let maybe_value = row.get(field.name());
+                                maybe_value.and_then(|value| value.as_str())
+                            })
+                            .collect::<BinaryArray>(),
+                    ) as ArrayRef),
                     DataType::List(ref list_field) => {
                         match list_field.data_type() {
                             DataType::Dictionary(ref key_ty, _) => {
@@ -1283,6 +1299,12 @@ impl Decoder {
                             .build();
                         Ok(make_array(data))
                     }
+                    DataType::Map(map_field, _) => self.build_map_array(
+                        rows,
+                        field.name(),
+                        field.data_type(),
+                        map_field,
+                    ),
                     _ => Err(ArrowError::JsonError(format!(
                         "{:?} type is not supported",
                         field.data_type()
@@ -1291,6 +1313,101 @@ impl Decoder {
             })
             .collect();
         arrays
+    }
+
+    fn build_map_array(
+        &self,
+        rows: &[Value],
+        field_name: &str,
+        map_type: &DataType,
+        struct_field: &Field,
+    ) -> Result<ArrayRef> {
+        // A map has the format {"key": "value"} where key is most commonly a string,
+        // but could be a string, number or boolean (🤷🏾‍♂️) (e.g. {1: "value"}).
+        // A map is also represented as a flattened contiguous array, with the number
+        // of key-value pairs being separated by a list offset.
+        // If row 1 has 2 key-value pairs, and row 2 has 3, the offsets would be
+        // [0, 2, 5].
+        //
+        // Thus we try to read a map by iterating through the keys and values
+
+        let (key_field, value_field) =
+            if let DataType::Struct(fields) = struct_field.data_type() {
+                if fields.len() != 2 {
+                    return Err(ArrowError::InvalidArgumentError(format!(
+                        "DataType::Map expects a struct with 2 fields, found {} fields",
+                        fields.len()
+                    )));
+                }
+                (&fields[0], &fields[1])
+            } else {
+                return Err(ArrowError::InvalidArgumentError(format!(
+                    "JSON map array builder expects a DataType::Map, found {:?}",
+                    struct_field.data_type()
+                )));
+            };
+        let value_map_iter = rows.iter().map(|value| {
+            value
+                .get(field_name)
+                .map(|v| v.as_object().map(|map| (map, map.len() as i32)))
+                .flatten()
+        });
+        let rows_len = rows.len();
+        let mut list_offsets = Vec::with_capacity(rows_len + 1);
+        list_offsets.push(0i32);
+        let mut last_offset = 0;
+        let num_bytes = bit_util::ceil(rows_len, 8);
+        let mut list_bitmap = MutableBuffer::from_len_zeroed(num_bytes);
+        let null_data = list_bitmap.as_slice_mut();
+
+        let struct_rows = value_map_iter
+            .enumerate()
+            .filter_map(|(i, v)| match v {
+                Some((map, len)) => {
+                    list_offsets.push(last_offset + len);
+                    last_offset += len;
+                    bit_util::set_bit(null_data, i);
+                    Some(map.iter().map(|(k, v)| {
+                        json!({
+                            key_field.name(): k,
+                            value_field.name(): v
+                        })
+                    }))
+                }
+                None => {
+                    list_offsets.push(last_offset);
+                    None
+                }
+            })
+            .flatten()
+            .collect::<Vec<Value>>();
+
+        let struct_children = self.build_struct_array(
+            struct_rows.as_slice(),
+            &[key_field.clone(), value_field.clone()],
+            &[],
+        )?;
+
+        Ok(make_array(ArrayData::new(
+            map_type.clone(),
+            rows_len,
+            None,
+            Some(list_bitmap.into()),
+            0,
+            vec![Buffer::from_slice_ref(&list_offsets)],
+            vec![ArrayData::new(
+                struct_field.data_type().clone(),
+                struct_children[0].len(),
+                None,
+                None,
+                0,
+                vec![],
+                struct_children
+                    .into_iter()
+                    .map(|array| array.data().clone())
+                    .collect(),
+            )],
+        )))
     }
 
     #[inline(always)]
@@ -1347,7 +1464,7 @@ impl Decoder {
                 }
             })
             .collect::<Vec<Option<T::Native>>>();
-        let array = PrimitiveArray::<T>::from_iter(values.iter());
+        let array = values.iter().collect::<PrimitiveArray<T>>();
         array.data().clone()
     }
 }
@@ -1569,6 +1686,14 @@ impl ReaderBuilder {
     }
 }
 
+impl<R: Read> Iterator for Reader<R> {
+    type Item = Result<RecordBatch>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next().transpose()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{
@@ -1628,8 +1753,8 @@ mod tests {
             .as_any()
             .downcast_ref::<BooleanArray>()
             .unwrap();
-        assert_eq!(false, cc.value(0));
-        assert_eq!(true, cc.value(10));
+        assert!(!cc.value(0));
+        assert!(cc.value(10));
         let dd = batch
             .column(d.0)
             .as_any()
@@ -1668,34 +1793,34 @@ mod tests {
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        assert_eq!(true, aa.is_valid(0));
-        assert_eq!(false, aa.is_valid(1));
-        assert_eq!(false, aa.is_valid(11));
+        assert!(aa.is_valid(0));
+        assert!(!aa.is_valid(1));
+        assert!(!aa.is_valid(11));
         let bb = batch
             .column(b.0)
             .as_any()
             .downcast_ref::<Float64Array>()
             .unwrap();
-        assert_eq!(true, bb.is_valid(0));
-        assert_eq!(false, bb.is_valid(2));
-        assert_eq!(false, bb.is_valid(11));
+        assert!(bb.is_valid(0));
+        assert!(!bb.is_valid(2));
+        assert!(!bb.is_valid(11));
         let cc = batch
             .column(c.0)
             .as_any()
             .downcast_ref::<BooleanArray>()
             .unwrap();
-        assert_eq!(true, cc.is_valid(0));
-        assert_eq!(false, cc.is_valid(4));
-        assert_eq!(false, cc.is_valid(11));
+        assert!(cc.is_valid(0));
+        assert!(!cc.is_valid(4));
+        assert!(!cc.is_valid(11));
         let dd = batch
             .column(d.0)
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap();
-        assert_eq!(false, dd.is_valid(0));
-        assert_eq!(true, dd.is_valid(1));
-        assert_eq!(false, dd.is_valid(4));
-        assert_eq!(false, dd.is_valid(11));
+        assert!(!dd.is_valid(0));
+        assert!(dd.is_valid(1));
+        assert!(!dd.is_valid(4));
+        assert!(!dd.is_valid(11));
     }
 
     #[test]
@@ -1738,7 +1863,7 @@ mod tests {
             .unwrap();
         assert_eq!(1, aa.value(0));
         // test that a 64bit value is returned as null due to overflowing
-        assert_eq!(false, aa.is_valid(11));
+        assert!(!aa.is_valid(11));
         let bb = batch
             .column(b.0)
             .as_any()
@@ -1824,6 +1949,7 @@ mod tests {
             .unwrap();
         assert_eq!(1, aa.value(0));
         assert_eq!(-10, aa.value(1));
+        assert_eq!(1627668684594000000, aa.value(2));
         let bb = batch
             .column(b.0)
             .as_any()
@@ -1834,7 +1960,7 @@ mod tests {
         assert_eq!(9, bb.len());
         assert!(2.0 - bb.value(0) < f64::EPSILON);
         assert!(-6.1 - bb.value(5) < f64::EPSILON);
-        assert_eq!(false, bb.is_valid(7));
+        assert!(!bb.is_valid(7));
 
         let cc = batch
             .column(c.0)
@@ -1844,9 +1970,9 @@ mod tests {
         let cc = cc.values();
         let cc = cc.as_any().downcast_ref::<BooleanArray>().unwrap();
         assert_eq!(6, cc.len());
-        assert_eq!(false, cc.value(0));
-        assert_eq!(false, cc.value(4));
-        assert_eq!(false, cc.is_valid(5));
+        assert!(!cc.value(0));
+        assert!(!cc.value(4));
+        assert!(!cc.is_valid(5));
     }
 
     #[test]
@@ -2171,6 +2297,81 @@ mod tests {
     }
 
     #[test]
+    fn test_map_json_arrays() {
+        let account_field = Field::new("account", DataType::UInt16, false);
+        let value_list_type =
+            DataType::List(Box::new(Field::new("item", DataType::Utf8, false)));
+        let entries_struct_type = DataType::Struct(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", value_list_type.clone(), true),
+        ]);
+        let stocks_field = Field::new(
+            "stocks",
+            DataType::Map(
+                Box::new(Field::new("entries", entries_struct_type.clone(), false)),
+                false,
+            ),
+            true,
+        );
+        let schema = Arc::new(Schema::new(vec![account_field, stocks_field.clone()]));
+        let builder = ReaderBuilder::new().with_schema(schema).with_batch_size(64);
+        // Note: account 456 has 'long' twice, to show that the JSON reader will overwrite
+        // existing keys. This thus guarantees unique keys for the map
+        let json_content = r#"
+        {"account": 123, "stocks":{"long": ["$AAA", "$BBB"], "short": ["$CCC", "$D"]}}
+        {"account": 456, "stocks":{"long": null, "long": ["$AAA", "$CCC", "$D"], "short": null}}
+        {"account": 789, "stocks":{"hedged": ["$YYY"], "long": null, "short": ["$D"]}}
+        "#;
+        let mut reader = builder.build(Cursor::new(json_content)).unwrap();
+
+        // build expected output
+        let expected_accounts = UInt16Array::from(vec![123, 456, 789]);
+
+        let expected_keys = StringArray::from(vec![
+            "long", "short", "long", "short", "hedged", "long", "short",
+        ])
+        .data()
+        .clone();
+        let expected_value_array_data = StringArray::from(vec![
+            "$AAA", "$BBB", "$CCC", "$D", "$AAA", "$CCC", "$D", "$YYY", "$D",
+        ])
+        .data()
+        .clone();
+        // Create the list that holds ["$_", "$_"]
+        let expected_values = ArrayDataBuilder::new(value_list_type)
+            .len(7)
+            .add_buffer(Buffer::from(
+                vec![0i32, 2, 4, 7, 7, 8, 8, 9].to_byte_slice(),
+            ))
+            .add_child_data(expected_value_array_data)
+            .null_bit_buffer(Buffer::from(vec![0b01010111]))
+            .build();
+        let expected_stocks_entries_data = ArrayDataBuilder::new(entries_struct_type)
+            .len(7)
+            .add_child_data(expected_keys)
+            .add_child_data(expected_values)
+            .build();
+        let expected_stocks_data =
+            ArrayDataBuilder::new(stocks_field.data_type().clone())
+                .len(3)
+                .add_buffer(Buffer::from(vec![0i32, 2, 4, 7].to_byte_slice()))
+                .add_child_data(expected_stocks_entries_data)
+                .build();
+
+        let expected_stocks = make_array(expected_stocks_data);
+
+        // compare with result from json reader
+        let batch = reader.next().unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 3);
+        assert_eq!(batch.num_columns(), 2);
+        let col1 = batch.column(0);
+        assert_eq!(col1.data(), expected_accounts.data());
+        // Compare the map
+        let col2 = batch.column(1);
+        assert_eq!(col2.data(), expected_stocks.data());
+    }
+
+    #[test]
     fn test_dictionary_from_json_basic_with_nulls() {
         let schema = Schema::new(vec![Field::new(
             "d",
@@ -2203,10 +2404,10 @@ mod tests {
             .as_any()
             .downcast_ref::<DictionaryArray<Int16Type>>()
             .unwrap();
-        assert_eq!(false, dd.is_valid(0));
-        assert_eq!(true, dd.is_valid(1));
-        assert_eq!(true, dd.is_valid(2));
-        assert_eq!(false, dd.is_valid(11));
+        assert!(!dd.is_valid(0));
+        assert!(dd.is_valid(1));
+        assert!(dd.is_valid(2));
+        assert!(!dd.is_valid(11));
 
         assert_eq!(
             dd.keys(),
@@ -2394,7 +2595,7 @@ mod tests {
             .downcast_ref::<DictionaryArray<UInt64Type>>()
             .unwrap();
         assert_eq!(6, evs_list.len());
-        assert_eq!(true, evs_list.is_valid(1));
+        assert!(evs_list.is_valid(1));
         assert_eq!(DataType::Utf8, evs_list.value_type());
 
         // dict from the events list
@@ -2455,7 +2656,7 @@ mod tests {
             .downcast_ref::<DictionaryArray<UInt64Type>>()
             .unwrap();
         assert_eq!(8, evs_list.len());
-        assert_eq!(true, evs_list.is_valid(1));
+        assert!(evs_list.is_valid(1));
         assert_eq!(DataType::Utf8, evs_list.value_type());
 
         // dict from the events list
@@ -2750,9 +2951,9 @@ mod tests {
             .as_any()
             .downcast_ref::<TimestampSecondArray>()
             .unwrap();
-        assert_eq!(true, aa.is_valid(0));
-        assert_eq!(false, aa.is_valid(1));
-        assert_eq!(false, aa.is_valid(2));
+        assert!(aa.is_valid(0));
+        assert!(!aa.is_valid(1));
+        assert!(!aa.is_valid(2));
         assert_eq!(1, aa.value(0));
         assert_eq!(1, aa.value(3));
         assert_eq!(5, aa.value(7));
@@ -2792,9 +2993,9 @@ mod tests {
             .as_any()
             .downcast_ref::<TimestampMillisecondArray>()
             .unwrap();
-        assert_eq!(true, aa.is_valid(0));
-        assert_eq!(false, aa.is_valid(1));
-        assert_eq!(false, aa.is_valid(2));
+        assert!(aa.is_valid(0));
+        assert!(!aa.is_valid(1));
+        assert!(!aa.is_valid(2));
         assert_eq!(1, aa.value(0));
         assert_eq!(1, aa.value(3));
         assert_eq!(5, aa.value(7));
@@ -2827,9 +3028,9 @@ mod tests {
             .as_any()
             .downcast_ref::<Date64Array>()
             .unwrap();
-        assert_eq!(true, aa.is_valid(0));
-        assert_eq!(false, aa.is_valid(1));
-        assert_eq!(false, aa.is_valid(2));
+        assert!(aa.is_valid(0));
+        assert!(!aa.is_valid(1));
+        assert!(!aa.is_valid(2));
         assert_eq!(1, aa.value(0));
         assert_eq!(1, aa.value(3));
         assert_eq!(5, aa.value(7));
@@ -2866,9 +3067,9 @@ mod tests {
             .as_any()
             .downcast_ref::<Time64NanosecondArray>()
             .unwrap();
-        assert_eq!(true, aa.is_valid(0));
-        assert_eq!(false, aa.is_valid(1));
-        assert_eq!(false, aa.is_valid(2));
+        assert!(aa.is_valid(0));
+        assert!(!aa.is_valid(1));
+        assert!(!aa.is_valid(2));
         assert_eq!(1, aa.value(0));
         assert_eq!(1, aa.value(3));
         assert_eq!(5, aa.value(7));
@@ -2945,5 +3146,68 @@ mod tests {
 
         assert_eq!(batch.num_columns(), 1);
         assert_eq!(batch.num_rows(), 3);
+    }
+
+    #[test]
+    fn test_json_read_binary_structs() {
+        let schema = Schema::new(vec![Field::new("c1", DataType::Binary, true)]);
+        let decoder = Decoder::new(Arc::new(schema), 1024, None);
+        let batch = decoder
+            .next_batch(
+                &mut vec![
+                    Ok(serde_json::json!({
+                        "c1": "₁₂₃",
+                    })),
+                    Ok(serde_json::json!({
+                        "c1": "foo",
+                    })),
+                ]
+                .into_iter(),
+            )
+            .unwrap()
+            .unwrap();
+        let data = batch.columns().iter().collect::<Vec<_>>();
+
+        let schema = Schema::new(vec![Field::new("c1", DataType::Binary, true)]);
+        let binary_values = BinaryArray::from(vec!["₁₂₃".as_bytes(), "foo".as_bytes()]);
+        let expected_batch =
+            RecordBatch::try_new(Arc::new(schema), vec![Arc::new(binary_values)])
+                .unwrap();
+        let expected_data = expected_batch.columns().iter().collect::<Vec<_>>();
+
+        assert_eq!(data, expected_data);
+        assert_eq!(batch.num_columns(), 1);
+        assert_eq!(batch.num_rows(), 2);
+    }
+
+    #[test]
+    fn test_json_iterator() {
+        let builder = ReaderBuilder::new().infer_schema(None).with_batch_size(5);
+        let reader: Reader<File> = builder
+            .build::<File>(File::open("test/data/basic.json").unwrap())
+            .unwrap();
+        let schema = reader.schema();
+        let (col_a_index, _) = schema.column_with_name("a").unwrap();
+
+        let mut sum_num_rows = 0;
+        let mut num_batches = 0;
+        let mut sum_a = 0;
+        for batch in reader {
+            let batch = batch.unwrap();
+            assert_eq!(4, batch.num_columns());
+            sum_num_rows += batch.num_rows();
+            num_batches += 1;
+            let batch_schema = batch.schema();
+            assert_eq!(schema, batch_schema);
+            let a_array = batch
+                .column(col_a_index)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            sum_a += (0..a_array.len()).map(|i| a_array.value(i)).sum::<i64>();
+        }
+        assert_eq!(12, sum_num_rows);
+        assert_eq!(3, num_batches);
+        assert_eq!(100000000000011, sum_a);
     }
 }

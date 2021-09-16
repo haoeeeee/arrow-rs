@@ -46,10 +46,11 @@ impl fmt::Debug for SliceableCursor {
 }
 
 impl SliceableCursor {
-    pub fn new(content: Vec<u8>) -> Self {
-        let size = content.len();
+    pub fn new(content: impl Into<Arc<Vec<u8>>>) -> Self {
+        let inner = content.into();
+        let size = inner.len();
         SliceableCursor {
-            inner: Arc::new(content),
+            inner,
             start: 0,
             pos: 0,
             length: size,
@@ -152,6 +153,18 @@ impl InMemoryWriteableCursor {
     pub fn data(&self) -> Vec<u8> {
         let inner = self.buffer.lock().unwrap();
         inner.get_ref().to_vec()
+    }
+
+    /// Returns a length of the underlying buffer
+    pub fn len(&self) -> usize {
+        let inner = self.buffer.lock().unwrap();
+        inner.get_ref().len()
+    }
+
+    /// Returns true if the underlying buffer contains no elements
+    pub fn is_empty(&self) -> bool {
+        let inner = self.buffer.lock().unwrap();
+        inner.get_ref().is_empty()
     }
 }
 

@@ -46,7 +46,10 @@ macro_rules! compare_op {
         let null_bit_buffer =
             combine_option_bitmap($left.data_ref(), $right.data_ref(), $left.len())?;
 
-        let comparison = (0..$left.len()).map(|i| $op($left.value(i), $right.value(i)));
+        // Safety:
+        // `i < $left.len()` and $left.len() == $right.len()
+        let comparison = (0..$left.len())
+            .map(|i| unsafe { $op($left.value_unchecked(i), $right.value_unchecked(i)) });
         // same size as $left.len() and $right.len()
         let buffer = unsafe { MutableBuffer::from_trusted_len_iter_bool(comparison) };
 
@@ -119,10 +122,16 @@ macro_rules! compare_op_primitive {
 }
 
 macro_rules! compare_op_scalar {
-    ($left: expr, $right:expr, $op:expr) => {{
-        let null_bit_buffer = $left.data().null_buffer().cloned();
+    ($left:expr, $right:expr, $op:expr) => {{
+        let null_bit_buffer = $left
+            .data()
+            .null_buffer()
+            .map(|b| b.bit_slice($left.offset(), $left.len()));
 
-        let comparison = (0..$left.len()).map(|i| $op($left.value(i), $right));
+        // Safety:
+        // `i < $left.len()`
+        let comparison =
+            (0..$left.len()).map(|i| unsafe { $op($left.value_unchecked(i), $right) });
         // same as $left.len()
         let buffer = unsafe { MutableBuffer::from_trusted_len_iter_bool(comparison) };
 
@@ -141,7 +150,10 @@ macro_rules! compare_op_scalar {
 
 macro_rules! compare_op_scalar_primitive {
     ($left: expr, $right:expr, $op:expr) => {{
-        let null_bit_buffer = $left.data().null_buffer().cloned();
+        let null_bit_buffer = $left
+            .data()
+            .null_buffer()
+            .map(|b| b.bit_slice($left.offset(), $left.len()));
 
         let mut values = MutableBuffer::from_len_zeroed(($left.len() + 7) / 8);
         let lhs_chunks_iter = $left.values().chunks_exact(8);
@@ -445,6 +457,136 @@ pub fn nlike_utf8_scalar<OffsetSize: StringOffsetSizeTrait>(
     Ok(BooleanArray::from(data))
 }
 
+/// Perform SQL `array ~ regex_array` operation on [`StringArray`] / [`LargeStringArray`].
+/// If `regex_array` element has an empty value, the corresponding result value is always true.
+///
+/// `flags_array` are optional [`StringArray`] / [`LargeStringArray`] flag, which allow
+/// special search modes, such as case insensitive and multi-line mode.
+/// See the documentation [here](https://docs.rs/regex/1.5.4/regex/#grouping-and-flags)
+/// for more information.
+pub fn regexp_is_match_utf8<OffsetSize: StringOffsetSizeTrait>(
+    array: &GenericStringArray<OffsetSize>,
+    regex_array: &GenericStringArray<OffsetSize>,
+    flags_array: Option<&GenericStringArray<OffsetSize>>,
+) -> Result<BooleanArray> {
+    if array.len() != regex_array.len() {
+        return Err(ArrowError::ComputeError(
+            "Cannot perform comparison operation on arrays of different length"
+                .to_string(),
+        ));
+    }
+    let null_bit_buffer =
+        combine_option_bitmap(array.data_ref(), regex_array.data_ref(), array.len())?;
+
+    let mut patterns: HashMap<String, Regex> = HashMap::new();
+    let mut result = BooleanBufferBuilder::new(array.len());
+
+    let complete_pattern = match flags_array {
+        Some(flags) => Box::new(regex_array.iter().zip(flags.iter()).map(
+            |(pattern, flags)| {
+                pattern.map(|pattern| match flags {
+                    Some(flag) => format!("(?{}){}", flag, pattern),
+                    None => pattern.to_string(),
+                })
+            },
+        )) as Box<dyn Iterator<Item = Option<String>>>,
+        None => Box::new(
+            regex_array
+                .iter()
+                .map(|pattern| pattern.map(|pattern| pattern.to_string())),
+        ),
+    };
+
+    array
+        .iter()
+        .zip(complete_pattern)
+        .map(|(value, pattern)| {
+            match (value, pattern) {
+                // Required for Postgres compatibility:
+                // SELECT 'foobarbequebaz' ~ ''); = true
+                (Some(_), Some(pattern)) if pattern == *"" => {
+                    result.append(true);
+                }
+                (Some(value), Some(pattern)) => {
+                    let existing_pattern = patterns.get(&pattern);
+                    let re = match existing_pattern {
+                        Some(re) => re.clone(),
+                        None => {
+                            let re = Regex::new(pattern.as_str()).map_err(|e| {
+                                ArrowError::ComputeError(format!(
+                                    "Regular expression did not compile: {:?}",
+                                    e
+                                ))
+                            })?;
+                            patterns.insert(pattern, re.clone());
+                            re
+                        }
+                    };
+                    result.append(re.is_match(value));
+                }
+                _ => result.append(false),
+            }
+            Ok(())
+        })
+        .collect::<Result<Vec<()>>>()?;
+
+    let data = ArrayData::new(
+        DataType::Boolean,
+        array.len(),
+        None,
+        null_bit_buffer,
+        0,
+        vec![result.finish()],
+        vec![],
+    );
+    Ok(BooleanArray::from(data))
+}
+
+/// Perform SQL `array ~ regex_array` operation on [`StringArray`] /
+/// [`LargeStringArray`] and a scalar.
+///
+/// See the documentation on [`regexp_is_match_utf8`] for more details.
+pub fn regexp_is_match_utf8_scalar<OffsetSize: StringOffsetSizeTrait>(
+    array: &GenericStringArray<OffsetSize>,
+    regex: &str,
+    flag: Option<&str>,
+) -> Result<BooleanArray> {
+    let null_bit_buffer = array.data().null_buffer().cloned();
+    let mut result = BooleanBufferBuilder::new(array.len());
+
+    let pattern = match flag {
+        Some(flag) => format!("(?{}){}", flag, regex),
+        None => regex.to_string(),
+    };
+    if pattern == *"" {
+        for _i in 0..array.len() {
+            result.append(true);
+        }
+    } else {
+        let re = Regex::new(pattern.as_str()).map_err(|e| {
+            ArrowError::ComputeError(format!(
+                "Regular expression did not compile: {:?}",
+                e
+            ))
+        })?;
+        for i in 0..array.len() {
+            let value = array.value(i);
+            result.append(re.is_match(value));
+        }
+    }
+
+    let data = ArrayData::new(
+        DataType::Boolean,
+        array.len(),
+        None,
+        null_bit_buffer,
+        0,
+        vec![result.finish()],
+        vec![],
+    );
+    Ok(BooleanArray::from(data))
+}
+
 /// Perform `left == right` operation on [`StringArray`] / [`LargeStringArray`].
 pub fn eq_utf8<OffsetSize: StringOffsetSizeTrait>(
     left: &GenericStringArray<OffsetSize>,
@@ -543,7 +685,7 @@ pub fn gt_eq_utf8_scalar<OffsetSize: StringOffsetSizeTrait>(
 
 /// Helper function to perform boolean lambda function on values from two arrays using
 /// SIMD.
-#[cfg(simd)]
+#[cfg(feature = "simd")]
 fn simd_compare_op<T, SIMD_OP, SCALAR_OP>(
     left: &PrimitiveArray<T>,
     right: &PrimitiveArray<T>,
@@ -591,7 +733,7 @@ where
 
                 let bitmask = T::mask_to_u64(&simd_result);
                 let bytes = bitmask.to_le_bytes();
-                &result_slice[0..lanes / 8].copy_from_slice(&bytes[0..lanes / 8]);
+                result_slice[0..lanes / 8].copy_from_slice(&bytes[0..lanes / 8]);
 
                 &mut result_slice[lanes / 8..]
             },
@@ -633,7 +775,7 @@ where
 
 /// Helper function to perform boolean lambda function on values from an array and a scalar value using
 /// SIMD.
-#[cfg(simd)]
+#[cfg(feature = "simd")]
 fn simd_compare_op_scalar<T, SIMD_OP, SCALAR_OP>(
     left: &PrimitiveArray<T>,
     right: T::Native,
@@ -669,7 +811,7 @@ where
 
             let bitmask = T::mask_to_u64(&simd_result);
             let bytes = bitmask.to_le_bytes();
-            &result_slice[0..lanes / 8].copy_from_slice(&bytes[0..lanes / 8]);
+            result_slice[0..lanes / 8].copy_from_slice(&bytes[0..lanes / 8]);
 
             &mut result_slice[lanes / 8..]
         },
@@ -719,9 +861,9 @@ pub fn eq<T>(left: &PrimitiveArray<T>, right: &PrimitiveArray<T>) -> Result<Bool
 where
     T: ArrowNumericType,
 {
-    #[cfg(simd)]
+    #[cfg(feature = "simd")]
     return simd_compare_op(left, right, T::eq, |a, b| a == b);
-    #[cfg(not(simd))]
+    #[cfg(not(feature = "simd"))]
     return compare_op!(left, right, |a, b| a == b);
 }
 
@@ -730,9 +872,9 @@ pub fn eq_scalar<T>(left: &PrimitiveArray<T>, right: T::Native) -> Result<Boolea
 where
     T: ArrowNumericType,
 {
-    #[cfg(simd)]
+    #[cfg(feature = "simd")]
     return simd_compare_op_scalar(left, right, T::eq, |a, b| a == b);
-    #[cfg(not(simd))]
+    #[cfg(not(feature = "simd"))]
     return compare_op_scalar!(left, right, |a, b| a == b);
 }
 
@@ -741,9 +883,9 @@ pub fn neq<T>(left: &PrimitiveArray<T>, right: &PrimitiveArray<T>) -> Result<Boo
 where
     T: ArrowNumericType,
 {
-    #[cfg(simd)]
+    #[cfg(feature = "simd")]
     return simd_compare_op(left, right, T::ne, |a, b| a != b);
-    #[cfg(not(simd))]
+    #[cfg(not(feature = "simd"))]
     return compare_op!(left, right, |a, b| a != b);
 }
 
@@ -752,9 +894,9 @@ pub fn neq_scalar<T>(left: &PrimitiveArray<T>, right: T::Native) -> Result<Boole
 where
     T: ArrowNumericType,
 {
-    #[cfg(simd)]
+    #[cfg(feature = "simd")]
     return simd_compare_op_scalar(left, right, T::ne, |a, b| a != b);
-    #[cfg(not(simd))]
+    #[cfg(not(feature = "simd"))]
     return compare_op_scalar!(left, right, |a, b| a != b);
 }
 
@@ -764,9 +906,9 @@ pub fn lt<T>(left: &PrimitiveArray<T>, right: &PrimitiveArray<T>) -> Result<Bool
 where
     T: ArrowNumericType,
 {
-    #[cfg(simd)]
+    #[cfg(feature = "simd")]
     return simd_compare_op(left, right, T::lt, |a, b| a < b);
-    #[cfg(not(simd))]
+    #[cfg(not(feature = "simd"))]
     return compare_op!(left, right, |a, b| a < b);
 }
 
@@ -776,9 +918,9 @@ pub fn lt_scalar<T>(left: &PrimitiveArray<T>, right: T::Native) -> Result<Boolea
 where
     T: ArrowNumericType,
 {
-    #[cfg(simd)]
+    #[cfg(feature = "simd")]
     return simd_compare_op_scalar(left, right, T::lt, |a, b| a < b);
-    #[cfg(not(simd))]
+    #[cfg(not(feature = "simd"))]
     return compare_op_scalar!(left, right, |a, b| a < b);
 }
 
@@ -791,9 +933,9 @@ pub fn lt_eq<T>(
 where
     T: ArrowNumericType,
 {
-    #[cfg(simd)]
+    #[cfg(feature = "simd")]
     return simd_compare_op(left, right, T::le, |a, b| a <= b);
-    #[cfg(not(simd))]
+    #[cfg(not(feature = "simd"))]
     return compare_op!(left, right, |a, b| a <= b);
 }
 
@@ -803,9 +945,9 @@ pub fn lt_eq_scalar<T>(left: &PrimitiveArray<T>, right: T::Native) -> Result<Boo
 where
     T: ArrowNumericType,
 {
-    #[cfg(simd)]
+    #[cfg(feature = "simd")]
     return simd_compare_op_scalar(left, right, T::le, |a, b| a <= b);
-    #[cfg(not(simd))]
+    #[cfg(not(feature = "simd"))]
     return compare_op_scalar!(left, right, |a, b| a <= b);
 }
 
@@ -815,9 +957,9 @@ pub fn gt<T>(left: &PrimitiveArray<T>, right: &PrimitiveArray<T>) -> Result<Bool
 where
     T: ArrowNumericType,
 {
-    #[cfg(simd)]
+    #[cfg(feature = "simd")]
     return simd_compare_op(left, right, T::gt, |a, b| a > b);
-    #[cfg(not(simd))]
+    #[cfg(not(feature = "simd"))]
     return compare_op!(left, right, |a, b| a > b);
 }
 
@@ -827,9 +969,9 @@ pub fn gt_scalar<T>(left: &PrimitiveArray<T>, right: T::Native) -> Result<Boolea
 where
     T: ArrowNumericType,
 {
-    #[cfg(simd)]
+    #[cfg(feature = "simd")]
     return simd_compare_op_scalar(left, right, T::gt, |a, b| a > b);
-    #[cfg(not(simd))]
+    #[cfg(not(feature = "simd"))]
     return compare_op_scalar!(left, right, |a, b| a > b);
 }
 
@@ -842,9 +984,9 @@ pub fn gt_eq<T>(
 where
     T: ArrowNumericType,
 {
-    #[cfg(simd)]
+    #[cfg(feature = "simd")]
     return simd_compare_op(left, right, T::ge, |a, b| a >= b);
-    #[cfg(not(simd))]
+    #[cfg(not(feature = "simd"))]
     return compare_op!(left, right, |a, b| a >= b);
 }
 
@@ -854,9 +996,9 @@ pub fn gt_eq_scalar<T>(left: &PrimitiveArray<T>, right: T::Native) -> Result<Boo
 where
     T: ArrowNumericType,
 {
-    #[cfg(simd)]
+    #[cfg(feature = "simd")]
     return simd_compare_op_scalar(left, right, T::ge, |a, b| a >= b);
-    #[cfg(not(simd))]
+    #[cfg(not(feature = "simd"))]
     return compare_op_scalar!(left, right, |a, b| a >= b);
 }
 
@@ -1042,12 +1184,24 @@ mod tests {
         let b = Int32Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
         let b_slice = b.slice(5, 5);
         let c = b_slice.as_any().downcast_ref().unwrap();
-        let d = eq(&c, &a).unwrap();
-        assert_eq!(true, d.value(0));
-        assert_eq!(true, d.value(1));
-        assert_eq!(true, d.value(2));
-        assert_eq!(false, d.value(3));
-        assert_eq!(true, d.value(4));
+        let d = eq(c, &a).unwrap();
+        assert!(d.value(0));
+        assert!(d.value(1));
+        assert!(d.value(2));
+        assert!(!d.value(3));
+        assert!(d.value(4));
+    }
+
+    #[test]
+    fn test_primitive_array_eq_scalar_with_slice() {
+        let a = Int32Array::from(vec![Some(1), None, Some(2), Some(3)]);
+        let a = a.slice(1, 3);
+        let a: &Int32Array = as_primitive_array(&a);
+        let a_eq = eq_scalar(a, 2).unwrap();
+        assert_eq!(
+            a_eq,
+            BooleanArray::from(vec![None, Some(true), Some(false)])
+        );
     }
 
     #[test]
@@ -1238,7 +1392,7 @@ mod tests {
         let b: Int32Array = (100..200).map(Some).collect();
         let b = b.slice(50, 50);
         let b = b.as_any().downcast_ref::<Int32Array>().unwrap();
-        let actual = lt(&a, &b).unwrap();
+        let actual = lt(a, b).unwrap();
         let expected: BooleanArray = (0..50).map(|_| Some(true)).collect();
         assert_eq!(expected, actual);
     }
@@ -1248,7 +1402,7 @@ mod tests {
         let a: Int32Array = (0..100).map(Some).collect();
         let a = a.slice(50, 50);
         let a = a.as_any().downcast_ref::<Int32Array>().unwrap();
-        let actual = lt_scalar(&a, 200).unwrap();
+        let actual = lt_scalar(a, 200).unwrap();
         let expected: BooleanArray = (0..50).map(|_| Some(true)).collect();
         assert_eq!(expected, actual);
     }
@@ -1394,6 +1548,18 @@ mod tests {
         };
     }
 
+    #[test]
+    fn test_utf8_eq_scalar_on_slice() {
+        let a = StringArray::from(vec![Some("hi"), None, Some("hello"), Some("world")]);
+        let a = a.slice(1, 3);
+        let a = as_string_array(&a);
+        let a_eq = eq_utf8_scalar(a, "hello").unwrap();
+        assert_eq!(
+            a_eq,
+            BooleanArray::from(vec![None, Some(true), Some(false)])
+        );
+    }
+
     macro_rules! test_utf8_scalar {
         ($test_name:ident, $left:expr, $right:expr, $op:expr, $expected:expr) => {
             #[test]
@@ -1416,6 +1582,82 @@ mod tests {
 
                 let left = LargeStringArray::from($left);
                 let res = $op(&left, $right).unwrap();
+                let expected = $expected;
+                assert_eq!(expected.len(), res.len());
+                for i in 0..res.len() {
+                    let v = res.value(i);
+                    assert_eq!(
+                        v,
+                        expected[i],
+                        "unexpected result when comparing {} at position {} to {} ",
+                        left.value(i),
+                        i,
+                        $right
+                    );
+                }
+            }
+        };
+    }
+
+    macro_rules! test_flag_utf8 {
+        ($test_name:ident, $left:expr, $right:expr, $op:expr, $expected:expr) => {
+            #[test]
+            fn $test_name() {
+                let left = StringArray::from($left);
+                let right = StringArray::from($right);
+                let res = $op(&left, &right, None).unwrap();
+                let expected = $expected;
+                assert_eq!(expected.len(), res.len());
+                for i in 0..res.len() {
+                    let v = res.value(i);
+                    assert_eq!(v, expected[i]);
+                }
+            }
+        };
+        ($test_name:ident, $left:expr, $right:expr, $flag:expr, $op:expr, $expected:expr) => {
+            #[test]
+            fn $test_name() {
+                let left = StringArray::from($left);
+                let right = StringArray::from($right);
+                let flag = Some(StringArray::from($flag));
+                let res = $op(&left, &right, flag.as_ref()).unwrap();
+                let expected = $expected;
+                assert_eq!(expected.len(), res.len());
+                for i in 0..res.len() {
+                    let v = res.value(i);
+                    assert_eq!(v, expected[i]);
+                }
+            }
+        };
+    }
+
+    macro_rules! test_flag_utf8_scalar {
+        ($test_name:ident, $left:expr, $right:expr, $op:expr, $expected:expr) => {
+            #[test]
+            fn $test_name() {
+                let left = StringArray::from($left);
+                let res = $op(&left, $right, None).unwrap();
+                let expected = $expected;
+                assert_eq!(expected.len(), res.len());
+                for i in 0..res.len() {
+                    let v = res.value(i);
+                    assert_eq!(
+                        v,
+                        expected[i],
+                        "unexpected result when comparing {} at position {} to {} ",
+                        left.value(i),
+                        i,
+                        $right
+                    );
+                }
+            }
+        };
+        ($test_name:ident, $left:expr, $right:expr, $flag:expr, $op:expr, $expected:expr) => {
+            #[test]
+            fn $test_name() {
+                let left = StringArray::from($left);
+                let flag = Some($flag);
+                let res = $op(&left, $right, flag).unwrap();
                 let expected = $expected;
                 assert_eq!(expected.len(), res.len());
                 for i in 0..res.len() {
@@ -1615,5 +1857,43 @@ mod tests {
         "flight",
         gt_eq_utf8_scalar,
         vec![false, false, true, true]
+    );
+    test_flag_utf8!(
+        test_utf8_array_regexp_is_match,
+        vec!["arrow", "arrow", "arrow", "arrow", "arrow", "arrow"],
+        vec!["^ar", "^AR", "ow$", "OW$", "foo", ""],
+        regexp_is_match_utf8,
+        vec![true, false, true, false, false, true]
+    );
+    test_flag_utf8!(
+        test_utf8_array_regexp_is_match_insensitive,
+        vec!["arrow", "arrow", "arrow", "arrow", "arrow", "arrow"],
+        vec!["^ar", "^AR", "ow$", "OW$", "foo", ""],
+        vec!["i"; 6],
+        regexp_is_match_utf8,
+        vec![true, true, true, true, false, true]
+    );
+
+    test_flag_utf8_scalar!(
+        test_utf8_array_regexp_is_match_scalar,
+        vec!["arrow", "ARROW", "parquet", "PARQUET"],
+        "^ar",
+        regexp_is_match_utf8_scalar,
+        vec![true, false, false, false]
+    );
+    test_flag_utf8_scalar!(
+        test_utf8_array_regexp_is_match_empty_scalar,
+        vec!["arrow", "ARROW", "parquet", "PARQUET"],
+        "",
+        regexp_is_match_utf8_scalar,
+        vec![true, true, true, true]
+    );
+    test_flag_utf8_scalar!(
+        test_utf8_array_regexp_is_match_insensitive_scalar,
+        vec!["arrow", "ARROW", "parquet", "PARQUET"],
+        "^ar",
+        "i",
+        regexp_is_match_utf8_scalar,
+        vec![true, true, false, false]
     );
 }

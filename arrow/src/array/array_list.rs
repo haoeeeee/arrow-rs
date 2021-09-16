@@ -17,7 +17,6 @@
 
 use std::any::Any;
 use std::fmt;
-use std::mem;
 
 use num::Num;
 
@@ -50,6 +49,9 @@ impl OffsetSizeTrait for i64 {
     }
 }
 
+/// Generic struct for a primitive Array
+///
+/// For non generic lists, you may wish to consider using [`ListArray`] or [`LargeListArray`]`
 pub struct GenericListArray<OffsetSize> {
     data: ArrayData,
     values: ArrayRef,
@@ -108,7 +110,7 @@ impl<OffsetSize: OffsetSizeTrait> GenericListArray<OffsetSize> {
 
     /// constructs a new iterator
     pub fn iter<'a>(&'a self) -> GenericListArrayIter<'a, OffsetSize> {
-        GenericListArrayIter::<'a, OffsetSize>::new(&self)
+        GenericListArrayIter::<'a, OffsetSize>::new(self)
     }
 
     #[inline]
@@ -251,22 +253,12 @@ impl<OffsetSize: OffsetSizeTrait> GenericListArray<OffsetSize> {
 }
 
 impl<OffsetSize: 'static + OffsetSizeTrait> Array for GenericListArray<OffsetSize> {
-    fn as_any(&self) -> &Any {
+    fn as_any(&self) -> &dyn Any {
         self
     }
 
     fn data(&self) -> &ArrayData {
         &self.data
-    }
-
-    /// Returns the total number of bytes of memory occupied by the buffers owned by this [ListArray].
-    fn get_buffer_memory_size(&self) -> usize {
-        self.data.get_buffer_memory_size()
-    }
-
-    /// Returns the total number of bytes of memory occupied physically by this [ListArray].
-    fn get_array_memory_size(&self) -> usize {
-        self.data.get_array_memory_size() + mem::size_of_val(self)
     }
 }
 
@@ -284,14 +276,73 @@ impl<OffsetSize: OffsetSizeTrait> fmt::Debug for GenericListArray<OffsetSize> {
 
 /// A list array where each element is a variable-sized sequence of values with the same
 /// type whose memory offsets between elements are represented by a i32.
+///
+/// # Example
+///
+/// ```
+///     # use arrow::array::{Array, ListArray, Int32Array};
+///     # use arrow::datatypes::{DataType, Int32Type};
+///     let data = vec![
+///        Some(vec![Some(0), Some(1), Some(2)]),
+///        None,
+///        Some(vec![Some(3), None, Some(5), Some(19)]),
+///        Some(vec![Some(6), Some(7)]),
+///     ];
+///     let list_array = ListArray::from_iter_primitive::<Int32Type, _, _>(data);
+///     assert_eq!(DataType::Int32, list_array.value_type());
+///     assert_eq!(4, list_array.len());
+///     assert_eq!(1, list_array.null_count());
+///     assert_eq!(3, list_array.value_length(0));
+///     assert_eq!(0, list_array.value_length(1));
+///     assert_eq!(4, list_array.value_length(2));
+///     assert_eq!(
+///         19,
+///         list_array
+///         .value(2)
+///         .as_any()
+///         .downcast_ref::<Int32Array>()
+///         .unwrap()
+///         .value(3)
+///     )
+/// ```
 pub type ListArray = GenericListArray<i32>;
 
 /// A list array where each element is a variable-sized sequence of values with the same
 /// type whose memory offsets between elements are represented by a i64.
+/// # Example
+///
+/// ```
+///     # use arrow::array::{Array, LargeListArray, Int64Array};
+///     # use arrow::datatypes::{DataType, Int64Type};
+///     let data = vec![
+///        Some(vec![Some(0), Some(1), Some(2)]),
+///        None,
+///        Some(vec![Some(3), None, Some(5), Some(19)]),
+///        Some(vec![Some(6), Some(7)]),
+///     ];
+///     let list_array = LargeListArray::from_iter_primitive::<Int64Type, _, _>(data);
+///     assert_eq!(DataType::Int64, list_array.value_type());
+///     assert_eq!(4, list_array.len());
+///     assert_eq!(1, list_array.null_count());
+///     assert_eq!(3, list_array.value_length(0));
+///     assert_eq!(0, list_array.value_length(1));
+///     assert_eq!(4, list_array.value_length(2));
+///     assert_eq!(
+///         19,
+///         list_array
+///         .value(2)
+///         .as_any()
+///         .downcast_ref::<Int64Array>()
+///         .unwrap()
+///         .value(3)
+///     )
+/// ```
 pub type LargeListArray = GenericListArray<i64>;
 
 /// A list array where each element is a fixed-size sequence of values with the same
 /// type whose maximum length is represented by a i32.
+///
+/// For non generic lists, you may wish to consider using [`FixedSizeBinaryArray`]
 pub struct FixedSizeListArray {
     data: ArrayData,
     values: ArrayRef,
@@ -377,24 +428,12 @@ impl From<ArrayData> for FixedSizeListArray {
 }
 
 impl Array for FixedSizeListArray {
-    fn as_any(&self) -> &Any {
+    fn as_any(&self) -> &dyn Any {
         self
     }
 
     fn data(&self) -> &ArrayData {
         &self.data
-    }
-
-    /// Returns the total number of bytes of memory occupied by the buffers owned by this [FixedSizeListArray].
-    fn get_buffer_memory_size(&self) -> usize {
-        self.data.get_buffer_memory_size() + self.values().get_buffer_memory_size()
-    }
-
-    /// Returns the total number of bytes of memory occupied physically by this [FixedSizeListArray].
-    fn get_array_memory_size(&self) -> usize {
-        self.data.get_array_memory_size()
-            + self.values().get_array_memory_size()
-            + mem::size_of_val(self)
     }
 }
 
@@ -1052,5 +1091,77 @@ mod tests {
             .add_child_data(value_data)
             .build();
         ListArray::from(list_data);
+    }
+
+    #[test]
+    fn list_array_equality() {
+        // test scaffold
+        fn do_comparison(
+            lhs_data: Vec<Option<Vec<Option<i32>>>>,
+            rhs_data: Vec<Option<Vec<Option<i32>>>>,
+            should_equal: bool,
+        ) {
+            let lhs = ListArray::from_iter_primitive::<Int32Type, _, _>(lhs_data.clone());
+            let rhs = ListArray::from_iter_primitive::<Int32Type, _, _>(rhs_data.clone());
+            assert_eq!(lhs == rhs, should_equal);
+
+            let lhs = LargeListArray::from_iter_primitive::<Int32Type, _, _>(lhs_data);
+            let rhs = LargeListArray::from_iter_primitive::<Int32Type, _, _>(rhs_data);
+            assert_eq!(lhs == rhs, should_equal);
+        }
+
+        do_comparison(
+            vec![
+                Some(vec![Some(0), Some(1), Some(2)]),
+                None,
+                Some(vec![Some(3), None, Some(5)]),
+                Some(vec![Some(6), Some(7)]),
+            ],
+            vec![
+                Some(vec![Some(0), Some(1), Some(2)]),
+                None,
+                Some(vec![Some(3), None, Some(5)]),
+                Some(vec![Some(6), Some(7)]),
+            ],
+            true,
+        );
+
+        do_comparison(
+            vec![
+                None,
+                None,
+                Some(vec![Some(3), None, Some(5)]),
+                Some(vec![Some(6), Some(7)]),
+            ],
+            vec![
+                Some(vec![Some(0), Some(1), Some(2)]),
+                None,
+                Some(vec![Some(3), None, Some(5)]),
+                Some(vec![Some(6), Some(7)]),
+            ],
+            false,
+        );
+
+        do_comparison(
+            vec![
+                None,
+                None,
+                Some(vec![Some(3), None, Some(5)]),
+                Some(vec![Some(6), Some(7)]),
+            ],
+            vec![
+                None,
+                None,
+                Some(vec![Some(3), None, Some(5)]),
+                Some(vec![Some(0), Some(0)]),
+            ],
+            false,
+        );
+
+        do_comparison(
+            vec![None, None, Some(vec![Some(1)])],
+            vec![None, None, Some(vec![Some(2)])],
+            false,
+        );
     }
 }

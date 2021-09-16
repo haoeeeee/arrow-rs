@@ -199,7 +199,7 @@ impl<'a, R: ChunkReader> SerializedRowGroupReader<'a, R> {
 
 impl<'a, R: 'static + ChunkReader> RowGroupReader for SerializedRowGroupReader<'a, R> {
     fn metadata(&self) -> &RowGroupMetaData {
-        &self.metadata
+        self.metadata
     }
 
     fn num_columns(&self) -> usize {
@@ -268,6 +268,14 @@ impl<T: Read> SerializedPageReader<T> {
         let mut prot = TCompactInputProtocol::new(&mut self.buf);
         let page_header = PageHeader::read_from_in_protocol(&mut prot)?;
         Ok(page_header)
+    }
+}
+
+impl<T: Read> Iterator for SerializedPageReader<T> {
+    type Item = Result<Page>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.get_next_page().transpose()
     }
 }
 
@@ -473,7 +481,7 @@ mod tests {
             .map(|p| SerializedFileReader::try_from(p.as_path()).unwrap())
             .flat_map(|r| {
                 let schema = "message schema { OPTIONAL INT32 id; }";
-                let proj = parse_message_type(&schema).ok();
+                let proj = parse_message_type(schema).ok();
 
                 r.into_iter().project(proj).unwrap()
             })
@@ -571,7 +579,7 @@ mod tests {
                     assert_eq!(buf.len(), 32);
                     assert_eq!(num_values, 8);
                     assert_eq!(encoding, Encoding::PLAIN_DICTIONARY);
-                    assert_eq!(is_sorted, false);
+                    assert!(!is_sorted);
                     true
                 }
                 Page::DataPage {
@@ -663,7 +671,7 @@ mod tests {
                     assert_eq!(buf.len(), 7);
                     assert_eq!(num_values, 1);
                     assert_eq!(encoding, Encoding::PLAIN);
-                    assert_eq!(is_sorted, false);
+                    assert!(!is_sorted);
                     true
                 }
                 Page::DataPageV2 {
@@ -684,7 +692,7 @@ mod tests {
                     assert_eq!(num_rows, 5);
                     assert_eq!(def_levels_byte_len, 2);
                     assert_eq!(rep_levels_byte_len, 0);
-                    assert_eq!(is_compressed, true);
+                    assert!(is_compressed);
                     assert!(statistics.is_some());
                     true
                 }
