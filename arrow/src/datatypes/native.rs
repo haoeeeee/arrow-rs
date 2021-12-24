@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use serde_json::{Number, Value};
-
 use super::DataType;
+use half::f16;
+use serde_json::{Number, Value};
 
 /// Trait declaring any type that is serializable to JSON. This includes all primitive types (bool, i32, etc.).
 pub trait JsonSerializable: 'static {
@@ -65,6 +65,12 @@ pub trait ArrowNativeType:
     /// Convert native type from i64.
     #[inline]
     fn from_i64(_: i64) -> Option<Self> {
+        None
+    }
+
+    /// Convert native type from i128.
+    #[inline]
+    fn from_i128(_: i128) -> Option<Self> {
         None
     }
 }
@@ -201,6 +207,35 @@ impl ArrowNativeType for i64 {
     }
 }
 
+impl JsonSerializable for i128 {
+    fn into_json_value(self) -> Option<Value> {
+        Some(self.into())
+    }
+}
+
+impl ArrowNativeType for i128 {
+    #[inline]
+    fn from_usize(v: usize) -> Option<Self> {
+        num::FromPrimitive::from_usize(v)
+    }
+
+    #[inline]
+    fn to_usize(&self) -> Option<usize> {
+        num::ToPrimitive::to_usize(self)
+    }
+
+    #[inline]
+    fn to_isize(&self) -> Option<isize> {
+        num::ToPrimitive::to_isize(self)
+    }
+
+    /// Convert native type from i128.
+    #[inline]
+    fn from_i128(val: i128) -> Option<Self> {
+        Some(val)
+    }
+}
+
 impl JsonSerializable for u8 {
     fn into_json_value(self) -> Option<Value> {
         Some(self.into())
@@ -293,6 +328,12 @@ impl ArrowNativeType for u64 {
     }
 }
 
+impl JsonSerializable for f16 {
+    fn into_json_value(self) -> Option<Value> {
+        Number::from_f64(f64::round(f64::from(self) * 1000.0) / 1000.0).map(Value::Number)
+    }
+}
+
 impl JsonSerializable for f32 {
     fn into_json_value(self) -> Option<Value> {
         Number::from_f64(f64::round(self as f64 * 1000.0) / 1000.0).map(Value::Number)
@@ -305,6 +346,7 @@ impl JsonSerializable for f64 {
     }
 }
 
+impl ArrowNativeType for f16 {}
 impl ArrowNativeType for f32 {}
 impl ArrowNativeType for f64 {}
 

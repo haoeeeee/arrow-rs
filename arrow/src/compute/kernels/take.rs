@@ -171,6 +171,9 @@ where
         DataType::Interval(IntervalUnit::DayTime) => {
             downcast_take!(IntervalDayTimeType, values, indices)
         }
+        DataType::Interval(IntervalUnit::MonthDayNano) => {
+            downcast_take!(IntervalMonthDayNanoType, values, indices)
+        }
         DataType::Duration(TimeUnit::Second) => {
             downcast_take!(DurationSecondType, values, indices)
         }
@@ -280,25 +283,28 @@ where
                 .unwrap();
             Ok(Arc::new(take_fixed_size_binary(values, indices)?))
         }
+        DataType::Null => {
+            // Take applied to a null array produces a null array.
+            if values.len() >= indices.len() {
+                // If the existing null array is as big as the indices, we can use a slice of it
+                // to avoid allocating a new null array.
+                Ok(values.slice(0, indices.len()))
+            } else {
+                // If the existing null array isn't big enough, create a new one.
+                Ok(new_null_array(&DataType::Null, indices.len()))
+            }
+        }
         t => unimplemented!("Take not supported for data type {:?}", t),
     }
 }
 
 /// Options that define how `take` should behave
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct TakeOptions {
     /// Perform bounds check before taking indices from values.
     /// If enabled, an `ArrowError` is returned if the indices are out of bounds.
     /// If not enabled, and indices exceed bounds, the kernel will panic.
     pub check_bounds: bool,
-}
-
-impl Default for TakeOptions {
-    fn default() -> Self {
-        Self {
-            check_bounds: false,
-        }
-    }
 }
 
 #[inline(always)]
@@ -523,15 +529,17 @@ where
         }
     };
 
-    let data = ArrayData::new(
-        T::DATA_TYPE,
-        indices.len(),
-        None,
-        nulls,
-        0,
-        vec![buffer],
-        vec![],
-    );
+    let data = unsafe {
+        ArrayData::new_unchecked(
+            values.data_type().clone(),
+            indices.len(),
+            None,
+            nulls,
+            0,
+            vec![buffer],
+            vec![],
+        )
+    };
     Ok(PrimitiveArray::<T>::from(data))
 }
 
@@ -598,15 +606,17 @@ where
         };
     }
 
-    let data = ArrayData::new(
-        DataType::Boolean,
-        indices.len(),
-        None,
-        nulls,
-        0,
-        vec![val_buf.into()],
-        vec![],
-    );
+    let data = unsafe {
+        ArrayData::new_unchecked(
+            DataType::Boolean,
+            indices.len(),
+            None,
+            nulls,
+            0,
+            vec![val_buf.into()],
+            vec![],
+        )
+    };
     Ok(BooleanArray::from(data))
 }
 
@@ -625,7 +635,8 @@ where
     let bytes_offset = (data_len + 1) * std::mem::size_of::<OffsetSize>();
     let mut offsets_buffer = MutableBuffer::from_len_zeroed(bytes_offset);
 
-    let offsets = offsets_buffer.typed_data_mut();
+    // Safety: the buffer is always treated as as a type of `OffsetSize` in the code below
+    let offsets = unsafe { offsets_buffer.typed_data_mut() };
     let mut values = MutableBuffer::new(0);
     let mut length_so_far = OffsetSize::zero();
     offsets[0] = length_so_far;
@@ -713,14 +724,17 @@ where
         };
     }
 
-    let mut data = ArrayData::builder(<OffsetSize as StringOffsetSizeTrait>::DATA_TYPE)
-        .len(data_len)
-        .add_buffer(offsets_buffer.into())
-        .add_buffer(values.into());
+    let mut array_data =
+        ArrayData::builder(<OffsetSize as StringOffsetSizeTrait>::DATA_TYPE)
+            .len(data_len)
+            .add_buffer(offsets_buffer.into())
+            .add_buffer(values.into());
     if let Some(null_buffer) = nulls {
-        data = data.null_bit_buffer(null_buffer);
+        array_data = array_data.null_bit_buffer(null_buffer);
     }
-    Ok(GenericStringArray::<OffsetSize>::from(data.build()))
+    let array_data = unsafe { array_data.build_unchecked() };
+
+    Ok(GenericStringArray::<OffsetSize>::from(array_data))
 }
 
 /// `take` implementation for list arrays
@@ -768,8 +782,10 @@ where
         .null_bit_buffer(null_buf.into())
         .offset(0)
         .add_child_data(taken.data().clone())
-        .add_buffer(value_offsets)
-        .build();
+        .add_buffer(value_offsets);
+
+    let list_data = unsafe { list_data.build_unchecked() };
+
     Ok(GenericListArray::<OffsetType::Native>::from(list_data))
 }
 
@@ -808,8 +824,9 @@ where
         .len(indices.len())
         .null_bit_buffer(null_buf.into())
         .offset(0)
-        .add_child_data(taken.data().clone())
-        .build();
+        .add_child_data(taken.data().clone());
+
+    let list_data = unsafe { list_data.build_unchecked() };
 
     Ok(FixedSizeListArray::from(list_data))
 }
@@ -884,15 +901,17 @@ where
     let new_keys = take_primitive::<T, I>(values.keys(), indices)?;
     let new_keys_data = new_keys.data_ref();
 
-    let data = ArrayData::new(
-        values.data_type().clone(),
-        new_keys.len(),
-        Some(new_keys_data.null_count()),
-        new_keys_data.null_buffer().cloned(),
-        0,
-        new_keys_data.buffers().to_vec(),
-        values.data().child_data().to_vec(),
-    );
+    let data = unsafe {
+        ArrayData::new_unchecked(
+            values.data_type().clone(),
+            new_keys.len(),
+            Some(new_keys_data.null_count()),
+            new_keys_data.null_buffer().cloned(),
+            0,
+            new_keys_data.buffers().to_vec(),
+            values.data().child_data().to_vec(),
+        )
+    };
 
     Ok(DictionaryArray::<T>::from(data))
 }
@@ -1170,6 +1189,15 @@ mod tests {
         )
         .unwrap();
 
+        // interval_month_day_nano
+        test_take_primitive_arrays::<IntervalMonthDayNanoType>(
+            vec![Some(0), None, Some(2), Some(-15), None],
+            &index,
+            None,
+            vec![Some(-15), None, None, Some(-15), Some(2)],
+        )
+        .unwrap();
+
         // duration_second
         test_take_primitive_arrays::<DurationSecondType>(
             vec![Some(0), None, Some(2), Some(-15), None],
@@ -1223,6 +1251,23 @@ mod tests {
             vec![Some(-3.1), None, None, Some(-3.1), Some(2.21)],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn test_take_preserve_timezone() {
+        let index = Int64Array::from(vec![Some(0), None]);
+
+        let input = TimestampNanosecondArray::from_vec(
+            vec![1_639_715_368_000_000_000, 1_639_715_368_000_000_000],
+            Some("UTC".to_owned()),
+        );
+        let result = take_impl(&input, &index, None).unwrap();
+        match result.data_type() {
+            DataType::Timestamp(TimeUnit::Nanosecond, tz) => {
+                assert_eq!(tz.clone(), Some("UTC".to_owned()))
+            }
+            _ => panic!(),
+        }
     }
 
     #[test]
@@ -1383,7 +1428,8 @@ mod tests {
                 .len(3)
                 .add_buffer(value_offsets)
                 .add_child_data(value_data)
-                .build();
+                .build()
+                .unwrap();
             let list_array = $list_array_type::from(list_data);
 
             // index returns: [[2,3], null, [-1,-2,-1], [2,3], [0,0,0]]
@@ -1421,7 +1467,8 @@ mod tests {
                 )
                 .add_buffer(expected_offsets)
                 .add_child_data(expected_data)
-                .build();
+                .build()
+                .unwrap();
             let expected_list_array = $list_array_type::from(expected_list_data);
 
             assert_eq!(a, &expected_list_array);
@@ -1458,7 +1505,8 @@ mod tests {
                 .add_buffer(value_offsets)
                 .null_bit_buffer(Buffer::from([0b10111101, 0b00000000]))
                 .add_child_data(value_data)
-                .build();
+                .build()
+                .unwrap();
             let list_array = $list_array_type::from(list_data);
 
             // index returns: [[null], null, [-1,-2,3], [2,null], [0,null,0]]
@@ -1495,7 +1543,8 @@ mod tests {
                 )
                 .add_buffer(expected_offsets)
                 .add_child_data(expected_data)
-                .build();
+                .build()
+                .unwrap();
             let expected_list_array = $list_array_type::from(expected_list_data);
 
             assert_eq!(a, &expected_list_array);
@@ -1531,7 +1580,8 @@ mod tests {
                 .add_buffer(value_offsets)
                 .null_bit_buffer(Buffer::from([0b01111101]))
                 .add_child_data(value_data)
-                .build();
+                .build()
+                .unwrap();
             let list_array = $list_array_type::from(list_data);
 
             // index returns: [null, null, [-1,-2,3], [5,null], [0,null,0]]
@@ -1569,7 +1619,8 @@ mod tests {
                 .null_bit_buffer(Buffer::from(null_bits))
                 .add_buffer(expected_offsets)
                 .add_child_data(expected_data)
-                .build();
+                .build()
+                .unwrap();
             let expected_list_array = $list_array_type::from(expected_list_data);
 
             assert_eq!(a, &expected_list_array);
@@ -1698,7 +1749,8 @@ mod tests {
             .len(3)
             .add_buffer(value_offsets)
             .add_child_data(value_data)
-            .build();
+            .build()
+            .unwrap();
         let list_array = ListArray::from(list_data);
 
         let index = UInt32Array::from(vec![1000]);
@@ -1792,6 +1844,38 @@ mod tests {
             vec![None],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn test_null_array_smaller_than_indices() {
+        let values = NullArray::new(2);
+        let indices = UInt32Array::from(vec![Some(0), None, Some(15)]);
+
+        let result = take(&values, &indices, None).unwrap();
+        let expected: ArrayRef = Arc::new(NullArray::new(3));
+        assert_eq!(&result, &expected);
+    }
+
+    #[test]
+    fn test_null_array_larger_than_indices() {
+        let values = NullArray::new(5);
+        let indices = UInt32Array::from(vec![Some(0), None, Some(15)]);
+
+        let result = take(&values, &indices, None).unwrap();
+        let expected: ArrayRef = Arc::new(NullArray::new(3));
+        assert_eq!(&result, &expected);
+    }
+
+    #[test]
+    fn test_null_array_indices_out_of_bounds() {
+        let values = NullArray::new(5);
+        let indices = UInt32Array::from(vec![Some(0), None, Some(15)]);
+
+        let result = take(&values, &indices, Some(TakeOptions { check_bounds: true }));
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Compute error: Array index out of bounds, cannot get item at index 15 from 5 entries"
+        );
     }
 
     #[test]

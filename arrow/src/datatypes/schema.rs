@@ -53,7 +53,6 @@ impl Schema {
     /// # Example
     ///
     /// ```
-    /// # extern crate arrow;
     /// # use arrow::datatypes::{Field, DataType, Schema};
     /// let field_a = Field::new("a", DataType::Int64, false);
     /// let field_b = Field::new("b", DataType::Boolean, false);
@@ -70,7 +69,6 @@ impl Schema {
     /// # Example
     ///
     /// ```
-    /// # extern crate arrow;
     /// # use arrow::datatypes::{Field, DataType, Schema};
     /// # use std::collections::HashMap;
     /// let field_a = Field::new("a", DataType::Int64, false);
@@ -87,6 +85,24 @@ impl Schema {
         metadata: HashMap<String, String>,
     ) -> Self {
         Self { fields, metadata }
+    }
+
+    /// Returns a new schema with only the specified columns in the new schema
+    /// This carries metadata from the parent schema over as well
+    pub fn project(&self, indices: &[usize]) -> Result<Schema> {
+        let new_fields = indices
+            .iter()
+            .map(|i| {
+                self.fields.get(*i).cloned().ok_or_else(|| {
+                    ArrowError::SchemaError(format!(
+                        "project index {} out of bounds, max field {}",
+                        i,
+                        self.fields().len()
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self::new_with_metadata(new_fields, self.metadata.clone()))
     }
 
     /// Merge schema into self if it is compatible. Struct fields will be merged recursively.
@@ -159,6 +175,12 @@ impl Schema {
         &self.fields
     }
 
+    /// Returns a vector with references to all fields (including nested fields)
+    #[inline]
+    pub(crate) fn all_fields(&self) -> Vec<&Field> {
+        self.fields.iter().map(|f| f.fields()).flatten().collect()
+    }
+
     /// Returns an immutable reference of a specific `Field` instance selected using an
     /// offset within the internal `fields` vector.
     pub fn field(&self, i: usize) -> &Field {
@@ -175,7 +197,8 @@ impl Schema {
     pub fn fields_with_dict_id(&self, dict_id: i64) -> Vec<&Field> {
         self.fields
             .iter()
-            .filter(|f| f.dict_id() == Some(dict_id))
+            .map(|f| f.fields_with_dict_id(dict_id))
+            .flatten()
             .collect()
     }
 
@@ -222,10 +245,7 @@ impl Schema {
         match *json {
             Value::Object(ref schema) => {
                 let fields = if let Some(Value::Array(fields)) = schema.get("fields") {
-                    fields
-                        .iter()
-                        .map(|f| Field::from(f))
-                        .collect::<Result<_>>()?
+                    fields.iter().map(Field::from).collect::<Result<_>>()?
                 } else {
                     return Err(ArrowError::ParseError(
                         "Schema fields should be an array".to_string(),
@@ -281,7 +301,7 @@ impl Schema {
         }
     }
 
-    /// Check to see if `self` is a superset of `other` schema. Here are the comparision rules:
+    /// Check to see if `self` is a superset of `other` schema. Here are the comparison rules:
     ///
     /// * `self` and `other` should contain the same number of fields
     /// * for every field `f` in `other`, the field in `self` with corresponding index should be a
@@ -366,5 +386,52 @@ mod tests {
         let de_schema = serde_json::from_str(&json).unwrap();
 
         assert_eq!(schema, de_schema);
+    }
+
+    #[test]
+    fn test_projection() {
+        let mut metadata = HashMap::new();
+        metadata.insert("meta".to_string(), "data".to_string());
+
+        let schema = Schema::new_with_metadata(
+            vec![
+                Field::new("name", DataType::Utf8, false),
+                Field::new("address", DataType::Utf8, false),
+                Field::new("priority", DataType::UInt8, false),
+            ],
+            metadata,
+        );
+
+        let projected: Schema = schema.project(&[0, 2]).unwrap();
+
+        assert_eq!(projected.fields().len(), 2);
+        assert_eq!(projected.fields()[0].name(), "name");
+        assert_eq!(projected.fields()[1].name(), "priority");
+        assert_eq!(projected.metadata.get("meta").unwrap(), "data")
+    }
+
+    #[test]
+    fn test_oob_projection() {
+        let mut metadata = HashMap::new();
+        metadata.insert("meta".to_string(), "data".to_string());
+
+        let schema = Schema::new_with_metadata(
+            vec![
+                Field::new("name", DataType::Utf8, false),
+                Field::new("address", DataType::Utf8, false),
+                Field::new("priority", DataType::UInt8, false),
+            ],
+            metadata,
+        );
+
+        let projected: Result<Schema> = schema.project(&[0, 3]);
+
+        assert!(projected.is_err());
+        if let Err(e) = projected {
+            assert_eq!(
+                e.to_string(),
+                "Schema error: project index 3 out of bounds, max field 3".to_string()
+            )
+        }
     }
 }

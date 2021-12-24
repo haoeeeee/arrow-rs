@@ -119,7 +119,7 @@ impl Buffer {
     }
 
     /// Returns the capacity of this buffer.
-    /// For exernally owned buffers, this returns zero
+    /// For externally owned buffers, this returns zero
     pub fn capacity(&self) -> usize {
         self.data.capacity()
     }
@@ -164,10 +164,6 @@ impl Buffer {
     /// `ArrowNativeType` is public so that it can be used as a trait bound for other public
     /// components, such as the `ToByteSlice` trait.  However, this means that it can be
     /// implemented by user defined types, which it is not intended for.
-    ///
-    /// Also `typed_data::<bool>` is unsafe as `0x00` and `0x01` are the only valid values for
-    /// `bool` in Rust.  However, `bool` arrays in Arrow are bit-packed which breaks this condition.
-    /// View buffer as typed slice.
     pub unsafe fn typed_data<T: ArrowNativeType + num::Num>(&self) -> &[T] {
         // JUSTIFICATION
         //  Benefit

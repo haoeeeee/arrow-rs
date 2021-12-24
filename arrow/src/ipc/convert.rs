@@ -263,6 +263,9 @@ pub(crate) fn get_data_type(field: ipc::Field, may_be_dictionary: bool) -> DataT
                     DataType::Interval(IntervalUnit::YearMonth)
                 }
                 ipc::IntervalUnit::DAY_TIME => DataType::Interval(IntervalUnit::DayTime),
+                ipc::IntervalUnit::MONTH_DAY_NANO => {
+                    DataType::Interval(IntervalUnit::MonthDayNano)
+                }
                 z => panic!("Interval type with unit of {:?} unsupported", z),
             }
         }
@@ -557,6 +560,7 @@ pub(crate) fn get_fb_field_type<'a>(
             let interval_unit = match unit {
                 IntervalUnit::YearMonth => ipc::IntervalUnit::YEAR_MONTH,
                 IntervalUnit::DayTime => ipc::IntervalUnit::DAY_TIME,
+                IntervalUnit::MonthDayNano => ipc::IntervalUnit::MONTH_DAY_NANO,
             };
             builder.add_unit(interval_unit);
             FBFieldType {
@@ -610,21 +614,7 @@ pub(crate) fn get_fb_field_type<'a>(
             // struct's fields are children
             let mut children = vec![];
             for field in fields {
-                let inner_types =
-                    get_fb_field_type(field.data_type(), field.is_nullable(), fbb);
-                let field_name = fbb.create_string(field.name());
-                children.push(ipc::Field::create(
-                    fbb,
-                    &ipc::FieldArgs {
-                        name: Some(field_name),
-                        nullable: field.is_nullable(),
-                        type_type: inner_types.type_type,
-                        type_: Some(inner_types.type_),
-                        dictionary: None,
-                        children: inner_types.children,
-                        custom_metadata: None,
-                    },
-                ));
+                children.push(build_field(fbb, field));
             }
             FBFieldType {
                 type_type: ipc::Type::Struct_,
@@ -771,6 +761,11 @@ mod tests {
                     DataType::Interval(IntervalUnit::DayTime),
                     true,
                 ),
+                Field::new(
+                    "interval[mdn]",
+                    DataType::Interval(IntervalUnit::MonthDayNano),
+                    true,
+                ),
                 Field::new("utf8", DataType::Utf8, false),
                 Field::new("binary", DataType::Binary, false),
                 Field::new(
@@ -789,6 +784,18 @@ mod tests {
                         ]),
                         true,
                     ))),
+                    false,
+                ),
+                Field::new(
+                    "struct<dictionary<int32, utf8>>",
+                    DataType::Struct(vec![Field::new(
+                        "dictionary<int32, utf8>",
+                        DataType::Dictionary(
+                            Box::new(DataType::Int32),
+                            Box::new(DataType::Utf8),
+                        ),
+                        false,
+                    )]),
                     false,
                 ),
                 Field::new(

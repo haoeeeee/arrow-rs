@@ -158,7 +158,7 @@ pub enum TimeUnit {
     Nanosecond,
 }
 
-/// YEAR_MONTH or DAY_TIME interval in SQL style.
+/// YEAR_MONTH, DAY_TIME, MONTH_DAY_NANO interval in SQL style.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum IntervalUnit {
     /// Indicates the number of elapsed whole months, stored as 4-byte integers.
@@ -166,6 +166,14 @@ pub enum IntervalUnit {
     /// Indicates the number of elapsed days and milliseconds,
     /// stored as 2 contiguous 32-bit integers (days, milliseconds) (8-bytes in total).
     DayTime,
+    /// A triple of the number of elapsed months, days, and nanoseconds.
+    /// The values are stored contiguously in 16 byte blocks. Months and
+    /// days are encoded as 32 bit integers and nanoseconds is encoded as a
+    /// 64 bit integer. All integers are signed. Each field is independent
+    /// (e.g. there is no constraint that nanoseconds have the same sign
+    /// as days or that the quantity of nanoseconds represents less
+    /// than a day's worth of time).
+    MonthDayNano,
 }
 
 impl fmt::Display for DataType {
@@ -286,6 +294,9 @@ impl DataType {
                     }
                     Some(p) if p == "YEAR_MONTH" => {
                         Ok(DataType::Interval(IntervalUnit::YearMonth))
+                    }
+                    Some(p) if p == "MONTH_DAY_NANO" => {
+                        Ok(DataType::Interval(IntervalUnit::MonthDayNano))
                     }
                     _ => Err(ArrowError::ParseError(
                         "interval unit missing or invalid".to_string(),
@@ -442,6 +453,7 @@ impl DataType {
             DataType::Interval(unit) => json!({"name": "interval", "unit": match unit {
                 IntervalUnit::YearMonth => "YEAR_MONTH",
                 IntervalUnit::DayTime => "DAY_TIME",
+                IntervalUnit::MonthDayNano => "MONTH_DAY_NANO",
             }}),
             DataType::Duration(unit) => json!({"name": "duration", "unit": match unit {
                 TimeUnit::Second => "SECOND",
@@ -474,6 +486,16 @@ impl DataType {
                 | Int64
                 | Float32
                 | Float64
+        )
+    }
+
+    /// Returns true if this type is valid as a dictionary key
+    /// (e.g. [`super::ArrowDictionaryKeyType`]
+    pub fn is_dictionary_key_type(t: &DataType) -> bool {
+        use DataType::*;
+        matches!(
+            t,
+            UInt8 | UInt16 | UInt32 | UInt64 | Int8 | Int16 | Int32 | Int64
         )
     }
 

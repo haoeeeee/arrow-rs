@@ -1,14 +1,3 @@
-use std::ptr::NonNull;
-
-use crate::{
-    alloc,
-    bytes::{Bytes, Deallocation},
-    datatypes::{ArrowNativeType, ToByteSlice},
-    util::bit_util,
-};
-
-use super::Buffer;
-
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -25,6 +14,15 @@ use super::Buffer;
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
+use super::Buffer;
+use crate::{
+    alloc,
+    bytes::{Bytes, Deallocation},
+    datatypes::{ArrowNativeType, ToByteSlice},
+    util::bit_util,
+};
+use std::ptr::NonNull;
 
 /// A [`MutableBuffer`] is Arrow's interface to build a [`Buffer`] out of items or slices of items.
 /// [`Buffer`]s created from [`MutableBuffer`] (via `into`) are guaranteed to have its pointer aligned
@@ -275,15 +273,20 @@ impl MutableBuffer {
     }
 
     /// View this buffer asa slice of a specific type.
+    ///
     /// # Safety
-    /// This function must only be used when this buffer was extended with items of type `T`.
-    /// Failure to do so results in undefined behavior.
-    pub fn typed_data_mut<T: ArrowNativeType>(&mut self) -> &mut [T] {
-        unsafe {
-            let (prefix, offsets, suffix) = self.as_slice_mut().align_to_mut::<T>();
-            assert!(prefix.is_empty() && suffix.is_empty());
-            offsets
-        }
+    ///
+    /// This function must only be used with buffers which are treated
+    /// as type `T` (e.g.  extended with items of type `T`).
+    ///
+    /// # Panics
+    ///
+    /// This function panics if the underlying buffer is not aligned
+    /// correctly for type `T`.
+    pub unsafe fn typed_data_mut<T: ArrowNativeType>(&mut self) -> &mut [T] {
+        let (prefix, offsets, suffix) = self.as_slice_mut().align_to_mut::<T>();
+        assert!(prefix.is_empty() && suffix.is_empty());
+        offsets
     }
 
     /// Extends this buffer from a slice of items that can be represented in bytes, increasing its capacity if needed.

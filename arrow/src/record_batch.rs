@@ -175,6 +175,25 @@ impl RecordBatch {
         self.schema.clone()
     }
 
+    /// Projects the schema onto the specified columns
+    pub fn project(&self, indices: &[usize]) -> Result<RecordBatch> {
+        let projected_schema = self.schema.project(indices)?;
+        let batch_fields = indices
+            .iter()
+            .map(|f| {
+                self.columns.get(*f).cloned().ok_or_else(|| {
+                    ArrowError::SchemaError(format!(
+                        "project index {} out of bounds, max field {}",
+                        f,
+                        self.columns.len()
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        RecordBatch::try_new(SchemaRef::new(projected_schema), batch_fields)
+    }
+
     /// Returns the number of columns in the record batch.
     ///
     /// # Example
@@ -608,7 +627,8 @@ mod tests {
         .add_child_data(a2_child.data().clone())
         .len(2)
         .add_buffer(Buffer::from(vec![0i32, 3, 4].to_byte_slice()))
-        .build();
+        .build()
+        .unwrap();
         let a2: ArrayRef = Arc::new(ListArray::from(a2));
         let a = ArrayDataBuilder::new(DataType::Struct(vec![
             Field::new("aa1", DataType::Int32, false),
@@ -617,7 +637,8 @@ mod tests {
         .add_child_data(a1.data().clone())
         .add_child_data(a2.data().clone())
         .len(2)
-        .build();
+        .build()
+        .unwrap();
         let a: ArrayRef = Arc::new(StructArray::from(a));
 
         // creating the batch with field name validation should fail
@@ -897,5 +918,24 @@ mod tests {
         .unwrap();
 
         assert_ne!(batch1, batch2);
+    }
+
+    #[test]
+    fn project() {
+        let a: ArrayRef = Arc::new(Int32Array::from(vec![Some(1), None, Some(3)]));
+        let b: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", "c"]));
+        let c: ArrayRef = Arc::new(StringArray::from(vec!["d", "e", "f"]));
+
+        let record_batch = RecordBatch::try_from_iter(vec![
+            ("a", a.clone()),
+            ("b", b.clone()),
+            ("c", c.clone()),
+        ])
+        .expect("valid conversion");
+
+        let expected = RecordBatch::try_from_iter(vec![("a", a), ("c", c)])
+            .expect("valid conversion");
+
+        assert_eq!(expected, record_batch.project(&[0, 2]).unwrap());
     }
 }

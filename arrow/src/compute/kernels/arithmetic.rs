@@ -57,7 +57,8 @@ where
     let buffer_size = array.len() * std::mem::size_of::<T::Native>();
     let mut result = MutableBuffer::new(buffer_size).with_bitset(buffer_size, false);
 
-    let mut result_chunks = result.typed_data_mut().chunks_exact_mut(lanes);
+    // safety: result is newly created above, always written as a T below
+    let mut result_chunks = unsafe { result.typed_data_mut().chunks_exact_mut(lanes) };
     let mut array_chunks = array.values().chunks_exact(lanes);
 
     result_chunks
@@ -78,18 +79,20 @@ where
         },
     );
 
-    let data = ArrayData::new(
-        T::DATA_TYPE,
-        array.len(),
-        None,
-        array
-            .data_ref()
-            .null_buffer()
-            .map(|b| b.bit_slice(array.offset(), array.len())),
-        0,
-        vec![result.into()],
-        vec![],
-    );
+    let data = unsafe {
+        ArrayData::new_unchecked(
+            T::DATA_TYPE,
+            array.len(),
+            None,
+            array
+                .data_ref()
+                .null_buffer()
+                .map(|b| b.bit_slice(array.offset(), array.len())),
+            0,
+            vec![result.into()],
+            vec![],
+        )
+    };
     Ok(PrimitiveArray::<T>::from(data))
 }
 
@@ -109,7 +112,8 @@ where
 
     let mut result = MutableBuffer::new(buffer_size).with_bitset(buffer_size, false);
 
-    let mut result_chunks = result.typed_data_mut().chunks_exact_mut(lanes);
+    // safety: result is newly created above, always written as a T below
+    let mut result_chunks = unsafe { result.typed_data_mut().chunks_exact_mut(lanes) };
     let mut array_chunks = array.values().chunks_exact(lanes);
 
     result_chunks
@@ -130,18 +134,20 @@ where
         },
     );
 
-    let data = ArrayData::new(
-        T::DATA_TYPE,
-        array.len(),
-        None,
-        array
-            .data_ref()
-            .null_buffer()
-            .map(|b| b.bit_slice(array.offset(), array.len())),
-        0,
-        vec![result.into()],
-        vec![],
-    );
+    let data = unsafe {
+        ArrayData::new_unchecked(
+            T::DATA_TYPE,
+            array.len(),
+            None,
+            array
+                .data_ref()
+                .null_buffer()
+                .map(|b| b.bit_slice(array.offset(), array.len())),
+            0,
+            vec![result.into()],
+            vec![],
+        )
+    };
     Ok(PrimitiveArray::<T>::from(data))
 }
 
@@ -182,15 +188,17 @@ where
     //      `values` is an iterator with a known size.
     let buffer = unsafe { Buffer::from_trusted_len_iter(values) };
 
-    let data = ArrayData::new(
-        T::DATA_TYPE,
-        left.len(),
-        None,
-        null_bit_buffer,
-        0,
-        vec![buffer],
-        vec![],
-    );
+    let data = unsafe {
+        ArrayData::new_unchecked(
+            T::DATA_TYPE,
+            left.len(),
+            None,
+            null_bit_buffer,
+            0,
+            vec![buffer],
+            vec![],
+        )
+    };
     Ok(PrimitiveArray::<T>::from(data))
 }
 
@@ -250,15 +258,17 @@ where
         unsafe { Buffer::try_from_trusted_len_iter(values) }
     }?;
 
-    let data = ArrayData::new(
-        T::DATA_TYPE,
-        left.len(),
-        None,
-        null_bit_buffer,
-        0,
-        vec![buffer],
-        vec![],
-    );
+    let data = unsafe {
+        ArrayData::new_unchecked(
+            T::DATA_TYPE,
+            left.len(),
+            None,
+            null_bit_buffer,
+            0,
+            vec![buffer],
+            vec![],
+        )
+    };
     Ok(PrimitiveArray::<T>::from(data))
 }
 
@@ -318,15 +328,17 @@ where
         unsafe { Buffer::try_from_trusted_len_iter(values) }
     }?;
 
-    let data = ArrayData::new(
-        T::DATA_TYPE,
-        left.len(),
-        None,
-        null_bit_buffer,
-        0,
-        vec![buffer],
-        vec![],
-    );
+    let data = unsafe {
+        ArrayData::new_unchecked(
+            T::DATA_TYPE,
+            left.len(),
+            None,
+            null_bit_buffer,
+            0,
+            vec![buffer],
+            vec![],
+        )
+    };
     Ok(PrimitiveArray::<T>::from(data))
 }
 
@@ -388,7 +400,8 @@ where
     let buffer_size = left.len() * std::mem::size_of::<T::Native>();
     let mut result = MutableBuffer::new(buffer_size).with_bitset(buffer_size, false);
 
-    let mut result_chunks = result.typed_data_mut().chunks_exact_mut(lanes);
+    // safety: result is newly created above, always written as a T below
+    let mut result_chunks = unsafe { result.typed_data_mut().chunks_exact_mut(lanes) };
     let mut left_chunks = left.values().chunks_exact(lanes);
     let mut right_chunks = right.values().chunks_exact(lanes);
 
@@ -413,15 +426,17 @@ where
             *scalar_result = scalar_op(*scalar_left, *scalar_right);
         });
 
-    let data = ArrayData::new(
-        T::DATA_TYPE,
-        left.len(),
-        None,
-        null_bit_buffer,
-        0,
-        vec![result.into()],
-        vec![],
-    );
+    let data = unsafe {
+        ArrayData::new_unchecked(
+            T::DATA_TYPE,
+            left.len(),
+            None,
+            null_bit_buffer,
+            0,
+            vec![result.into()],
+            vec![],
+        )
+    };
     Ok(PrimitiveArray::<T>::from(data))
 }
 
@@ -650,7 +665,10 @@ where
             let valid_chunks = b.bit_chunks(0, left.len());
 
             // process data in chunks of 64 elements since we also get 64 bits of validity information at a time
-            let mut result_chunks = result.typed_data_mut().chunks_exact_mut(64);
+
+            // safety: result is newly created above, always written as a T below
+            let mut result_chunks =
+                unsafe { result.typed_data_mut().chunks_exact_mut(64) };
             let mut left_chunks = left.values().chunks_exact(64);
             let mut right_chunks = right.values().chunks_exact(64);
 
@@ -695,7 +713,9 @@ where
             )?;
         }
         None => {
-            let mut result_chunks = result.typed_data_mut().chunks_exact_mut(lanes);
+            // safety: result is newly created above, always written as a T below
+            let mut result_chunks =
+                unsafe { result.typed_data_mut().chunks_exact_mut(lanes) };
             let mut left_chunks = left.values().chunks_exact(lanes);
             let mut right_chunks = right.values().chunks_exact(lanes);
 
@@ -725,15 +745,17 @@ where
         }
     }
 
-    let data = ArrayData::new(
-        T::DATA_TYPE,
-        left.len(),
-        None,
-        null_bit_buffer,
-        0,
-        vec![result.into()],
-        vec![],
-    );
+    let data = unsafe {
+        ArrayData::new_unchecked(
+            T::DATA_TYPE,
+            left.len(),
+            None,
+            null_bit_buffer,
+            0,
+            vec![result.into()],
+            vec![],
+        )
+    };
     Ok(PrimitiveArray::<T>::from(data))
 }
 
@@ -770,7 +792,10 @@ where
             let valid_chunks = b.bit_chunks(0, left.len());
 
             // process data in chunks of 64 elements since we also get 64 bits of validity information at a time
-            let mut result_chunks = result.typed_data_mut().chunks_exact_mut(64);
+
+            // safety: result is newly created above, always written as a T below
+            let mut result_chunks =
+                unsafe { result.typed_data_mut().chunks_exact_mut(64) };
             let mut left_chunks = left.values().chunks_exact(64);
             let mut right_chunks = right.values().chunks_exact(64);
 
@@ -815,7 +840,9 @@ where
             )?;
         }
         None => {
-            let mut result_chunks = result.typed_data_mut().chunks_exact_mut(lanes);
+            // safety: result is newly created above, always written as a T below
+            let mut result_chunks =
+                unsafe { result.typed_data_mut().chunks_exact_mut(lanes) };
             let mut left_chunks = left.values().chunks_exact(lanes);
             let mut right_chunks = right.values().chunks_exact(lanes);
 
@@ -845,15 +872,17 @@ where
         }
     }
 
-    let data = ArrayData::new(
-        T::DATA_TYPE,
-        left.len(),
-        None,
-        null_bit_buffer,
-        0,
-        vec![result.into()],
-        vec![],
-    );
+    let data = unsafe {
+        ArrayData::new_unchecked(
+            T::DATA_TYPE,
+            left.len(),
+            None,
+            null_bit_buffer,
+            0,
+            vec![result.into()],
+            vec![],
+        )
+    };
     Ok(PrimitiveArray::<T>::from(data))
 }
 
@@ -875,7 +904,8 @@ where
     let buffer_size = array.len() * std::mem::size_of::<T::Native>();
     let mut result = MutableBuffer::new(buffer_size).with_bitset(buffer_size, false);
 
-    let mut result_chunks = result.typed_data_mut().chunks_exact_mut(lanes);
+    // safety: result is newly created above, always written as a T below
+    let mut result_chunks = unsafe { result.typed_data_mut().chunks_exact_mut(lanes) };
     let mut array_chunks = array.values().chunks_exact(lanes);
 
     result_chunks
@@ -891,18 +921,20 @@ where
 
     simd_checked_modulus_scalar_remainder::<T>(array_chunks, modulo, result_chunks)?;
 
-    let data = ArrayData::new(
-        T::DATA_TYPE,
-        array.len(),
-        None,
-        array
-            .data_ref()
-            .null_buffer()
-            .map(|b| b.bit_slice(array.offset(), array.len())),
-        0,
-        vec![result.into()],
-        vec![],
-    );
+    let data = unsafe {
+        ArrayData::new_unchecked(
+            T::DATA_TYPE,
+            array.len(),
+            None,
+            array
+                .data_ref()
+                .null_buffer()
+                .map(|b| b.bit_slice(array.offset(), array.len())),
+            0,
+            vec![result.into()],
+            vec![],
+        )
+    };
     Ok(PrimitiveArray::<T>::from(data))
 }
 
@@ -924,7 +956,8 @@ where
     let buffer_size = array.len() * std::mem::size_of::<T::Native>();
     let mut result = MutableBuffer::new(buffer_size).with_bitset(buffer_size, false);
 
-    let mut result_chunks = result.typed_data_mut().chunks_exact_mut(lanes);
+    // safety: result is newly created above, always written as a T below
+    let mut result_chunks = unsafe { result.typed_data_mut().chunks_exact_mut(lanes) };
     let mut array_chunks = array.values().chunks_exact(lanes);
 
     result_chunks
@@ -940,18 +973,20 @@ where
 
     simd_checked_divide_scalar_remainder::<T>(array_chunks, divisor, result_chunks)?;
 
-    let data = ArrayData::new(
-        T::DATA_TYPE,
-        array.len(),
-        None,
-        array
-            .data_ref()
-            .null_buffer()
-            .map(|b| b.bit_slice(array.offset(), array.len())),
-        0,
-        vec![result.into()],
-        vec![],
-    );
+    let data = unsafe {
+        ArrayData::new_unchecked(
+            T::DATA_TYPE,
+            array.len(),
+            None,
+            array
+                .data_ref()
+                .null_buffer()
+                .map(|b| b.bit_slice(array.offset(), array.len())),
+            0,
+            vec![result.into()],
+            vec![],
+        )
+    };
     Ok(PrimitiveArray::<T>::from(data))
 }
 

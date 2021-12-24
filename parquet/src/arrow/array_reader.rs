@@ -100,6 +100,36 @@ pub trait ArrayReader {
     fn get_rep_levels(&self) -> Option<&[i16]>;
 }
 
+/// Uses `record_reader` to read up to `batch_size` records from `pages`
+///
+/// Returns the number of records read, which can be less than batch_size if
+/// pages is exhausted.
+fn read_records<T: DataType>(
+    record_reader: &mut RecordReader<T>,
+    pages: &mut dyn PageIterator,
+    batch_size: usize,
+) -> Result<usize> {
+    let mut records_read = 0usize;
+    while records_read < batch_size {
+        let records_to_read = batch_size - records_read;
+
+        let records_read_once = record_reader.read_records(records_to_read)?;
+        records_read += records_read_once;
+
+        // Record reader exhausted
+        if records_read_once < records_to_read {
+            if let Some(page_reader) = pages.next() {
+                // Read from new page reader (i.e. column chunk)
+                record_reader.set_page_reader(page_reader?)?;
+            } else {
+                // Page reader also exhausted
+                break;
+            }
+        }
+    }
+    Ok(records_read)
+}
+
 /// A NullArrayReader reads Parquet columns stored as null int32s with an Arrow
 /// NullArray type.
 pub struct NullArrayReader<T: DataType> {
@@ -114,14 +144,8 @@ pub struct NullArrayReader<T: DataType> {
 
 impl<T: DataType> NullArrayReader<T> {
     /// Construct null array reader.
-    pub fn new(
-        mut pages: Box<dyn PageIterator>,
-        column_desc: ColumnDescPtr,
-    ) -> Result<Self> {
-        let mut record_reader = RecordReader::<T>::new(column_desc.clone());
-        if let Some(page_reader) = pages.next() {
-            record_reader.set_page_reader(page_reader?)?;
-        }
+    pub fn new(pages: Box<dyn PageIterator>, column_desc: ColumnDescPtr) -> Result<Self> {
+        let record_reader = RecordReader::<T>::new(column_desc.clone());
 
         Ok(Self {
             data_type: ArrowType::Null,
@@ -148,25 +172,8 @@ impl<T: DataType> ArrayReader for NullArrayReader<T> {
 
     /// Reads at most `batch_size` records into array.
     fn next_batch(&mut self, batch_size: usize) -> Result<ArrayRef> {
-        let mut records_read = 0usize;
-        while records_read < batch_size {
-            let records_to_read = batch_size - records_read;
-
-            // NB can be 0 if at end of page
-            let records_read_once = self.record_reader.read_records(records_to_read)?;
-            records_read += records_read_once;
-
-            // Record reader exhausted
-            if records_read_once < records_to_read {
-                if let Some(page_reader) = self.pages.next() {
-                    // Read from new page reader
-                    self.record_reader.set_page_reader(page_reader?)?;
-                } else {
-                    // Page reader also exhausted
-                    break;
-                }
-            }
-        }
+        let records_read =
+            read_records(&mut self.record_reader, self.pages.as_mut(), batch_size)?;
 
         // convert to arrays
         let array = arrow::array::NullArray::new(records_read);
@@ -206,7 +213,7 @@ pub struct PrimitiveArrayReader<T: DataType> {
 impl<T: DataType> PrimitiveArrayReader<T> {
     /// Construct primitive array reader.
     pub fn new(
-        mut pages: Box<dyn PageIterator>,
+        pages: Box<dyn PageIterator>,
         column_desc: ColumnDescPtr,
         arrow_type: Option<ArrowType>,
     ) -> Result<Self> {
@@ -218,10 +225,7 @@ impl<T: DataType> PrimitiveArrayReader<T> {
                 .clone(),
         };
 
-        let mut record_reader = RecordReader::<T>::new(column_desc.clone());
-        if let Some(page_reader) = pages.next() {
-            record_reader.set_page_reader(page_reader?)?;
-        }
+        let record_reader = RecordReader::<T>::new(column_desc.clone());
 
         Ok(Self {
             data_type,
@@ -248,25 +252,7 @@ impl<T: DataType> ArrayReader for PrimitiveArrayReader<T> {
 
     /// Reads at most `batch_size` records into array.
     fn next_batch(&mut self, batch_size: usize) -> Result<ArrayRef> {
-        let mut records_read = 0usize;
-        while records_read < batch_size {
-            let records_to_read = batch_size - records_read;
-
-            // NB can be 0 if at end of page
-            let records_read_once = self.record_reader.read_records(records_to_read)?;
-            records_read += records_read_once;
-
-            // Record reader exhausted
-            if records_read_once < records_to_read {
-                if let Some(page_reader) = self.pages.next() {
-                    // Read from new page reader
-                    self.record_reader.set_page_reader(page_reader?)?;
-                } else {
-                    // Page reader also exhausted
-                    break;
-                }
-            }
-        }
+        read_records(&mut self.record_reader, self.pages.as_mut(), batch_size)?;
 
         let target_type = self.get_data_type().clone();
         let arrow_data_type = match T::get_physical_type() {
@@ -324,25 +310,20 @@ impl<T: DataType> ArrayReader for PrimitiveArrayReader<T> {
             array_data = array_data.null_bit_buffer(b);
         }
 
+        let array_data = unsafe { array_data.build_unchecked() };
         let array = match T::get_physical_type() {
-            PhysicalType::BOOLEAN => {
-                Arc::new(BooleanArray::from(array_data.build())) as ArrayRef
-            }
+            PhysicalType::BOOLEAN => Arc::new(BooleanArray::from(array_data)) as ArrayRef,
             PhysicalType::INT32 => {
-                Arc::new(PrimitiveArray::<ArrowInt32Type>::from(array_data.build()))
-                    as ArrayRef
+                Arc::new(PrimitiveArray::<ArrowInt32Type>::from(array_data)) as ArrayRef
             }
             PhysicalType::INT64 => {
-                Arc::new(PrimitiveArray::<ArrowInt64Type>::from(array_data.build()))
-                    as ArrayRef
+                Arc::new(PrimitiveArray::<ArrowInt64Type>::from(array_data)) as ArrayRef
             }
             PhysicalType::FLOAT => {
-                Arc::new(PrimitiveArray::<ArrowFloat32Type>::from(array_data.build()))
-                    as ArrayRef
+                Arc::new(PrimitiveArray::<ArrowFloat32Type>::from(array_data)) as ArrayRef
             }
             PhysicalType::DOUBLE => {
-                Arc::new(PrimitiveArray::<ArrowFloat64Type>::from(array_data.build()))
-                    as ArrayRef
+                Arc::new(PrimitiveArray::<ArrowFloat64Type>::from(array_data)) as ArrayRef
             }
             PhysicalType::INT96
             | PhysicalType::BYTE_ARRAY
@@ -904,8 +885,9 @@ impl<OffsetSize: OffsetSizeTrait> ArrayReader for ListArrayReader<OffsetSize> {
             .add_buffer(value_offsets)
             .add_child_data(batch_values.data().clone())
             .null_bit_buffer(null_buf.into())
-            .offset(next_batch_array.offset())
-            .build();
+            .offset(next_batch_array.offset());
+
+        let list_data = unsafe { list_data.build_unchecked() };
 
         let result_array = GenericListArray::<OffsetSize>::from(list_data);
         Ok(Arc::new(result_array))
@@ -1000,8 +982,8 @@ impl ArrayReader for MapArrayReader {
         let entry_data = ArrayDataBuilder::new(entry_data_type)
             .len(key_length)
             .add_child_data(key_array.data().clone())
-            .add_child_data(value_array.data().clone())
-            .build();
+            .add_child_data(value_array.data().clone());
+        let entry_data = unsafe { entry_data.build_unchecked() };
 
         let entry_len = rep_levels.iter().filter(|level| **level == 0).count();
 
@@ -1044,8 +1026,9 @@ impl ArrayReader for MapArrayReader {
             .len(entry_len)
             .add_buffer(value_offsets)
             .null_bit_buffer(null_buf.into())
-            .add_child_data(entry_data)
-            .build();
+            .add_child_data(entry_data);
+
+        let array_data = unsafe { array_data.build_unchecked() };
 
         Ok(Arc::new(MapArray::from(array_data)))
     }
@@ -1157,7 +1140,8 @@ impl ArrayReader for StructArrayReader {
         let mut def_level_data_buffer = MutableBuffer::new(buffer_size);
         def_level_data_buffer.resize(buffer_size, 0);
 
-        let def_level_data = def_level_data_buffer.typed_data_mut();
+        // Safety: the buffer is always treated as `u16` in the code below
+        let def_level_data = unsafe { def_level_data_buffer.typed_data_mut() };
 
         def_level_data
             .iter_mut()
@@ -1192,8 +1176,8 @@ impl ArrayReader for StructArrayReader {
                     .iter()
                     .map(|x| x.data().clone())
                     .collect::<Vec<ArrayData>>(),
-            )
-            .build();
+            );
+        let array_data = unsafe { array_data.build_unchecked() };
 
         // calculate struct rep level data, since struct doesn't add to repetition
         // levels, here we just need to keep repetition levels of first array
