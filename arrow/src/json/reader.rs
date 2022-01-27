@@ -1113,7 +1113,7 @@ impl Decoder {
     /// If `projection` is not empty, then all values are returned. The first level of projection
     /// occurs at the `RecordBatch` level. No further projection currently occurs, but would be
     /// useful if plucking values from a struct, e.g. getting `a.b.c.e` from `a.b.c.{d, e}`.
-    fn build_struct_array(
+    pub fn build_struct_array(
         &self,
         rows: &[Value],
         struct_fields: &[Field],
